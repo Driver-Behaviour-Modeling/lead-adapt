@@ -34,16 +34,24 @@ def compute_deltas(poses: np.ndarray) -> np.ndarray:
     Compute frame-to-frame deltas from poses.
     
     Args:
-        poses: [N, 3] array of (x, y, heading) poses in local ego coordinates
+        poses: [N, 3] array of (x, y, heading) poses in global coordinates
         
     Returns:
-        deltas: [N-1, 3] array of (Δx, Δy, Δheading) deltas
+        deltas: [N-1, 3] array of (Δx, Δy, Δheading) deltas in the local frame of the previous step
     """
-    delta_x = poses[1:, 0] - poses[:-1, 0]
-    delta_y = poses[1:, 1] - poses[:-1, 1]
+    delta_x_global = poses[1:, 0] - poses[:-1, 0]
+    delta_y_global = poses[1:, 1] - poses[:-1, 1]
     delta_heading = wrap_angle(poses[1:, 2] - poses[:-1, 2])
     
-    return np.column_stack([delta_x, delta_y, delta_heading])
+    # Rotate global deltas into the local ego frame of the previous step
+    headings = poses[:-1, 2]
+    cos_h = np.cos(headings)
+    sin_h = np.sin(headings)
+    
+    delta_x_local = cos_h * delta_x_global + sin_h * delta_y_global
+    delta_y_local = -sin_h * delta_x_global + cos_h * delta_y_global
+    
+    return np.column_stack([delta_x_local, delta_y_local, delta_heading])
 
 
 def transform_to_ego_frame(pose_global: np.ndarray, 
