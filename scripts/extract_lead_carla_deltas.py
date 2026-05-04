@@ -16,6 +16,8 @@ from pathlib import Path
 import logging
 from typing import Optional
 
+import lead.common.common_utils as common_utils
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -43,47 +45,23 @@ def compute_deltas(poses: np.ndarray) -> np.ndarray:
     delta_y_global = poses[1:, 1] - poses[:-1, 1]
     delta_heading = wrap_angle(poses[1:, 2] - poses[:-1, 2])
     
-    # Rotate global deltas into the local ego frame of the previous step
+    # Transform position deltas from global to ego frame using common_utils
+    # (same rotation used by Plant agent for route transformation)
     headings = poses[:-1, 2]
-    cos_h = np.cos(headings)
-    sin_h = np.sin(headings)
+    delta_xy_global = np.column_stack([delta_x_global, delta_y_global])
     
-    delta_x_local = cos_h * delta_x_global + sin_h * delta_y_global
-    delta_y_local = -sin_h * delta_x_global + cos_h * delta_y_global
+    # Apply inverse_conversion_2d with zero translation (only rotation matters for deltas)
+    delta_xy_local = np.array([
+        common_utils.inverse_conversion_2d(
+            point=delta_xy_global[i],
+            translation=np.array([0.0, 0.0]),  # No translation for deltas
+            yaw=headings[i]
+        )
+        for i in range(len(headings))
+    ])
     
-    return np.column_stack([delta_x_local, delta_y_local, delta_heading])
+    return np.column_stack([delta_xy_local[:, 0], delta_xy_local[:, 1], delta_heading])
 
-
-def transform_to_ego_frame(pose_global: np.ndarray, 
-                           ego_pose_global: np.ndarray) -> np.ndarray:
-    """
-    Transform a global pose to ego-centric frame.
-    
-    Args:
-        pose_global: [x, y, heading] in global coordinates
-        ego_pose_global: [x, y, heading] ego pose in global coordinates
-        
-    Returns:
-        pose_ego: [x, y, heading] relative to ego pose
-    """
-    # Extract components
-    x, y, h = pose_global
-    ego_x, ego_y, ego_h = ego_pose_global
-    
-    # Translate to ego origin
-    dx = x - ego_x
-    dy = y - ego_y
-    
-    # Rotate to ego frame (relative heading)
-    cos_h = np.cos(ego_h)
-    sin_h = np.sin(ego_h)
-    x_ego = cos_h * dx + sin_h * dy
-    y_ego = -sin_h * dx + cos_h * dy
-    
-    # Relative heading
-    h_ego = wrap_angle(h - ego_h)
-    
-    return np.array([x_ego, y_ego, h_ego])
 
 
 def extract_deltas_from_meta(meta_dict: dict) -> Optional[np.ndarray]:
