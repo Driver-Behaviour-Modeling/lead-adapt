@@ -16,6 +16,11 @@ from pathlib import Path
 import logging
 from typing import Optional
 
+try:
+    import zstandard as zstd
+except Exception:  # pragma: no cover - optional dependency
+    zstd = None
+
 import lead.common.common_utils as common_utils
 
 # Setup logging
@@ -24,6 +29,24 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 LOG = logging.getLogger(__name__)
+
+
+def load_meta_file(meta_path: Path) -> dict:
+    """Load a meta file that may be raw pickle or zstd-compressed pickle."""
+    with open(meta_path, "rb") as f:
+        header = f.read(4)
+        f.seek(0)
+        # Zstandard magic bytes: 28 B5 2F FD (little endian read often starts with FD)
+        if header in (b"\x28\xb5\x2f\xfd", b"\xfd\x2f\xb5\x28"):
+            if zstd is None:
+                raise RuntimeError(
+                    "zstandard is required to read compressed meta files. "
+                    "Install with: pip install zstandard"
+                )
+            dctx = zstd.ZstdDecompressor()
+            decompressed = dctx.decompress(f.read())
+            return pickle.loads(decompressed)
+        return pickle.load(f)
 
 
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
@@ -162,8 +185,7 @@ def extract_all_deltas_from_directory(
         extraction_failed_count = 0
         for meta_file in meta_files:
             try:
-                with open(meta_file, 'rb') as f:
-                    meta_dict = pickle.load(f)
+                meta_dict = load_meta_file(meta_file)
                 
                 pose = extract_deltas_from_meta(meta_dict)
                 if pose is not None:
@@ -269,8 +291,7 @@ def diagnose_data_structure(carla_data_dir: Path, num_samples: int = 5) -> None:
             # Check first file
             first_file = meta_files[0]
             try:
-                with open(first_file, 'rb') as f:
-                    meta_dict = pickle.load(f)
+                meta_dict = load_meta_file(first_file)
                 
                 LOG.info(f"  First file ({first_file.name}):")
                 LOG.info(f"    Keys: {list(meta_dict.keys())}")
