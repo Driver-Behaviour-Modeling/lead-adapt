@@ -124,7 +124,7 @@ def compute_deltas(poses: np.ndarray) -> np.ndarray:
             common_utils.inverse_conversion_2d(
                 point=delta_xy_global[i],
                 translation=np.array([0.0, 0.0]),  # No translation for deltas
-                yaw=headings[i]
+                yaw=float(headings[i])
             )
             for i in range(len(headings))
         ])
