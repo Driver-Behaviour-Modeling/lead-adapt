@@ -386,7 +386,7 @@ if __name__ == "__main__":
             "/mnt/data/carla_expert",
         ]:
             LOG.error(f"  - {p}")
-        return
+        raise SystemExit(1)
     
     carla_data_root = Path(carla_data_root)
     
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     if args.diagnose:
         LOG.info(f"Diagnostic mode: Examining data structure at {carla_data_root}")
         diagnose_data_structure(carla_data_root)
-        return
+        raise SystemExit(0)
     
     if args.verbose:
         LOG.info("")
@@ -419,7 +419,7 @@ if __name__ == "__main__":
         LOG.error("")
         LOG.error("Try running diagnostic mode to check data structure:")
         LOG.error("  python lead/scripts/extract_lead_carla_deltas.py --diagnose")
-        return
+        raise SystemExit(1)
     
     # Save deltas
     LOG.info("")
