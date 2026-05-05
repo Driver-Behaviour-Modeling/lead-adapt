@@ -16,6 +16,7 @@ from pathlib import Path
 import logging
 from typing import Optional
 import io
+import lzma
 
 try:
     import zstandard as zstd
@@ -39,6 +40,11 @@ def load_meta_file(meta_path: Path) -> dict:
 
     if not data:
         raise RuntimeError(f"Empty meta file: {meta_path}")
+
+    # XZ magic bytes: FD 37 7A 58 5A 00
+    if data[:6] == b"\xfd7zXZ\x00":
+        decompressed = lzma.decompress(data)
+        return pickle.loads(decompressed)
 
     # Zstandard magic bytes: 28 B5 2F FD (some files may appear reversed)
     zstd_magic = (b"\x28\xb5\x2f\xfd", b"\xfd\x2f\xb5\x28")
@@ -69,11 +75,20 @@ def load_meta_file(meta_path: Path) -> dict:
                     decompressed = reader.read()
                 return pickle.loads(decompressed)
             except Exception as zstd_error:
-                raise RuntimeError(
-                    f"Failed to load meta file {meta_path}: "
-                    f"pickle_error={pickle_error}, zstd_error={zstd_error}"
-                )
-        raise
+                try:
+                    decompressed = lzma.decompress(data)
+                    return pickle.loads(decompressed)
+                except Exception as lzma_error:
+                    raise RuntimeError(
+                        f"Failed to load meta file {meta_path}: "
+                        f"pickle_error={pickle_error}, zstd_error={zstd_error}, "
+                        f"lzma_error={lzma_error}"
+                    )
+        try:
+            decompressed = lzma.decompress(data)
+            return pickle.loads(decompressed)
+        except Exception:
+            raise
 
 
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
