@@ -162,8 +162,8 @@ def extract_deltas_from_meta(meta_dict: dict) -> Optional[np.ndarray]:
         theta = meta_dict.get("theta", 0.0)
         
         # Validate pose data
-        if pos_global.shape != (2,):
-            LOG.debug(f"Invalid pos_global shape: {pos_global.shape}, expected (2,)")
+        if pos_global.shape not in ((2,), (3,)):
+            LOG.debug(f"Invalid pos_global shape: {pos_global.shape}, expected (2,) or (3,)")
             return None
         
         if not isinstance(theta, (int, float, np.number)):
