@@ -34,19 +34,43 @@ LOG = logging.getLogger(__name__)
 def load_meta_file(meta_path: Path) -> dict:
     """Load a meta file that may be raw pickle or zstd-compressed pickle."""
     with open(meta_path, "rb") as f:
-        header = f.read(4)
-        f.seek(0)
-        # Zstandard magic bytes: 28 B5 2F FD (little endian read often starts with FD)
-        if header in (b"\x28\xb5\x2f\xfd", b"\xfd\x2f\xb5\x28"):
-            if zstd is None:
-                raise RuntimeError(
-                    "zstandard is required to read compressed meta files. "
-                    "Install with: pip install zstandard"
-                )
+        data = f.read()
+
+    if not data:
+        raise RuntimeError(f"Empty meta file: {meta_path}")
+
+    # Zstandard magic bytes: 28 B5 2F FD (some files may appear reversed)
+    zstd_magic = (b"\x28\xb5\x2f\xfd", b"\xfd\x2f\xb5\x28")
+    looks_zstd = data[:4] in zstd_magic or data[0] in (0x28, 0xFD)
+
+    if looks_zstd:
+        if zstd is None:
+            raise RuntimeError(
+                "zstandard is required to read compressed meta files. "
+                "Install with: pip install zstandard"
+            )
+        try:
             dctx = zstd.ZstdDecompressor()
-            decompressed = dctx.decompress(f.read())
+            decompressed = dctx.decompress(data)
             return pickle.loads(decompressed)
-        return pickle.load(f)
+        except Exception:
+            # Fall back to raw pickle if decompression fails
+            pass
+
+    try:
+        return pickle.loads(data)
+    except Exception as pickle_error:
+        if zstd is not None:
+            try:
+                dctx = zstd.ZstdDecompressor()
+                decompressed = dctx.decompress(data)
+                return pickle.loads(decompressed)
+            except Exception as zstd_error:
+                raise RuntimeError(
+                    f"Failed to load meta file {meta_path}: "
+                    f"pickle_error={pickle_error}, zstd_error={zstd_error}"
+                )
+        raise
 
 
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
