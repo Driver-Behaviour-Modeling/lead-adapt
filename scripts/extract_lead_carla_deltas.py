@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import logging
 from typing import Optional
+import io
 
 try:
     import zstandard as zstd
@@ -51,7 +52,8 @@ def load_meta_file(meta_path: Path) -> dict:
             )
         try:
             dctx = zstd.ZstdDecompressor()
-            decompressed = dctx.decompress(data)
+            with dctx.stream_reader(io.BytesIO(data)) as reader:
+                decompressed = reader.read()
             return pickle.loads(decompressed)
         except Exception:
             # Fall back to raw pickle if decompression fails
@@ -63,7 +65,8 @@ def load_meta_file(meta_path: Path) -> dict:
         if zstd is not None:
             try:
                 dctx = zstd.ZstdDecompressor()
-                decompressed = dctx.decompress(data)
+                with dctx.stream_reader(io.BytesIO(data)) as reader:
+                    decompressed = reader.read()
                 return pickle.loads(decompressed)
             except Exception as zstd_error:
                 raise RuntimeError(
