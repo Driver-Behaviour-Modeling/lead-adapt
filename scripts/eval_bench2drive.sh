@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Checkpoints
-export CHECKPOINT_DIR=outputs/checkpoints/noradar_resnet34
+export CHECKPOINT_DIR=outputs/checkpoints/tfv6_resnet34
 export ROUTES=data/benchmark_routes/bench2drive/23687.xml
 
 # Set environment variables
