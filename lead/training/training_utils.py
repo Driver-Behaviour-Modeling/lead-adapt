@@ -69,6 +69,10 @@ def create_model(config: TrainingConfig) -> torch.nn.Module:
         from lead.plant.plant_model import PlantModel
 
         return PlantModel(config.device, config)
+    if config.model_type == "adapt":
+        from lead.adapt.adapt import TFv6 as AdaptModel
+
+        return AdaptModel(config.device, config)
     from lead.tfv6.tfv6 import TFv6
 
     return TFv6(config.device, config)

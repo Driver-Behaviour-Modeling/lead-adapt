@@ -12,9 +12,26 @@ from torch import nn
 import lead.common.common_utils as common_utils
 from lead.common.constants import RadarLabels
 from lead.adapt import transfuser_utils as fn
+from lead.kdisks import KDisksModel
 from lead.training.config_training import TrainingConfig
 
 logger = logging.getLogger(__name__)
+
+
+def generate_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    """Build an upper-triangular causal mask compatible with ``nn.MultiheadAttention``.
+
+    Args:
+        seq_len: Length of the target sequence.
+        device: Device the mask is materialised on.
+
+    Returns:
+        A ``[seq_len, seq_len]`` boolean mask where ``True`` marks positions
+        that must not be attended to.
+    """
+    return torch.triu(
+        torch.ones(seq_len, seq_len, device=device), diagonal=1,
+    ).bool()
 
 
 class AdaptDecoderOutput(TypedDict):
@@ -204,34 +221,15 @@ class AdaptDecoder(nn.Module):
             device=self.device,
         )
 
-        # Number of queries: route + waypoints + target_speed (flexible based on config)
-        num_queries = 0
-        if self.config.predict_spatial_path:
-            num_queries += self.config.num_route_points_prediction
-        if self.config.predict_temporal_spatial_waypoints:
-            num_queries += self.config.num_way_points_prediction
-        if self.config.predict_target_speed:
-            num_queries += 1
+        # K-disks tokenizer: loads the frozen codebook from
+        # ``config.kdisks_vocab_path`` and exposes ``_compute_deltas`` /
+        # ``encode`` / ``decode`` for kinematic tokenization.
+        self.kdisks_model = KDisksModel(self.config)
+        self._num_history_poses = self.config.num_history_poses
+        self._num_future_poses = self.config.num_way_points_prediction
 
-        self.query = nn.Parameter(
-            torch.zeros(
-                1,
-                num_queries,
-                self.config.transfuser_token_dim,
-            ),
-        )
-
-        # self.transformer_decoder = torch.nn.TransformerDecoder(
-        #     decoder_layer=nn.TransformerDecoderLayer(
-        #         self.config.transfuser_token_dim,
-        #         self.config.transfuser_num_bev_cross_attention_heads,
-        #         activation=nn.GELU(),
-        #         batch_first=True,
-        #     ),
-        #     num_layers=self.config.transfuser_num_bev_cross_attention_layers,
-        #     norm=nn.LayerNorm(self.config.transfuser_token_dim),
-        # )
-
+        # Autoregressive token decoder. Operates at ``kinematic_embed_dim``;
+        # cross-attends to ``context_tokens`` from the context encoder.
         self.transformer_decoder = Decoder(
             kinematic_vocab_size=config.kinematic_vocab_size,
             d_model=config.kinematic_embed_dim,
@@ -239,50 +237,57 @@ class AdaptDecoder(nn.Module):
             num_heads=config.decoder_num_heads,
             drop_prob=config.decoder_dropout,
             num_layers=config.decoder_num_layers,
-            max_sequence_length=config.max_sequence_length
+            max_sequence_length=config.max_sequence_length,
         )
 
-        # Output projection: decoder hidden state → logits over codebook
-        self.output_projection = nn.Linear(config.kinematic_embed_dim, config.kinematic_vocab_size)
+        # The context encoder emits tokens at ``transfuser_token_dim`` while
+        # the decoder operates at ``kinematic_embed_dim``. ``MultiheadAttention``
+        # requires query/key dim parity, so we project when they differ.
+        if self.config.kinematic_embed_dim != self.config.transfuser_token_dim:
+            self.context_proj = nn.Linear(
+                self.config.transfuser_token_dim,
+                self.config.kinematic_embed_dim,
+            )
+        else:
+            self.context_proj = nn.Identity()
 
-        # Trajectory refinement head: decoder hidden states → continuous trajectory
-        # Concatenation preserves temporal ordering (mean-pooling destroys it)
+        # Fold history poses (x, y, heading) into the cross-attention context.
+        # Mirrors ADAPT's ``_history_pose_proj`` so the decoder sees both BEV
+        # tokens and continuous past poses.
+        self.history_pose_proj = nn.Linear(3, self.config.kinematic_embed_dim)
+
+        # Learned positional embedding over the concatenated encoder context
+        # (context_tokens from the encoder + projected history poses). The
+        # exact BEV-token count is only known at forward time, so we size the
+        # embedding to a generous upper bound; unused rows are inert.
+        max_context_len = (
+            self.adapt_context_encoder.num_status_tokens
+            + 1024  # upper bound on flattened BEV grid + scratch
+            + self._num_history_poses
+        )
+        self.encoder_context_pos_embedding = nn.Embedding(
+            max_context_len,
+            self.config.kinematic_embed_dim,
+        )
+
+        # Output projection: decoder hidden state → logits over codebook.
+        self.output_projection = nn.Linear(
+            config.kinematic_embed_dim, config.kinematic_vocab_size,
+        )
+
+        # Trajectory refinement head: concat decoder hidden states → (x, y, h)
+        # trajectory. Concatenation preserves temporal ordering vs mean-pooling.
         self._trajectory_head = nn.Sequential(
-            nn.Linear(config.kinematic_embed_dim * config.num_poses, config.decoder_ffn_dim),
+            nn.Linear(
+                config.kinematic_embed_dim * self._num_future_poses,
+                config.decoder_ffn_dim,
+            ),
             nn.ReLU(),
-            nn.Linear(config.decoder_ffn_dim, config.num_poses * 3),
+            nn.Linear(config.decoder_ffn_dim, self._num_future_poses * 3),
         )
 
-        # # Only create decoders if needed
-        # if self.config.predict_spatial_path:
-        #     self.route_decoder = nn.Linear(config.transfuser_token_dim, 2)
-        # if self.config.predict_temporal_spatial_waypoints:
-        #     self.wp_decoder = nn.Linear(config.transfuser_token_dim, 2)
-        #     if self.config.use_navsim_data:
-        #         self.heading_decoder = nn.Linear(config.transfuser_token_dim, 1)
-        # if self.config.predict_target_speed:
-        #     self.target_speed_decoder = nn.Sequential(
-        #         nn.Linear(
-        #             self.config.transfuser_token_dim,
-        #             self.config.transfuser_token_dim,
-        #         ),
-        #         nn.ReLU(inplace=True),
-        #         nn.Linear(
-        #             self.config.transfuser_token_dim,
-        #             len(self.config.target_speed_classes),
-        #         ),
-        #     )
-
-        self.tp_normalization_constants = torch.tensor(
-            self.config.target_points_normalization_constants,
-            device=self.device,
-            dtype=self.config.torch_float_type,
-        )
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.uniform_(self.query)
+        # Scheduled-sampling probability — bumped by the training loop if used.
+        self._ss_prob = 0.0
 
     @beartype
     def forward(
@@ -293,141 +298,226 @@ class AdaptDecoder(nn.Module):
     ) -> AdaptDecoderOutput:
         """Run the autoregressive ADAPT decoder over BEV-derived context.
 
+        Mirrors the NavSim ADAPT forward path (history pose extraction →
+        K-disks tokenization → encoder context build → AR decode → trajectory
+        head) but consumes the LEAD-style ``data`` dict instead of NavSim's
+        feature dict.
+
         Args:
             bev_features: Raw BEV feature grid from the backbone.
-            data: Per-batch data dict (status, history poses, future GT, ...).
+            data: Per-batch data dict. Required keys: ``past_positions`` and
+                ``past_yaws`` for history. During training, ``future_waypoints``
+                and ``future_yaws`` are used to build teacher-forcing targets.
             log: Mutable log dict for metrics.
 
         Returns:
-            Dict with at least ``pred_future_waypoints``, ``pred_headings``,
+            Dict with ``pred_future_waypoints``, ``pred_headings``,
             ``trajectory``, ``output_logits``, ``future_token_ids``,
             ``future_deltas``, ``centroids``, ``kinematic_tokens``,
             ``commitment_loss`` and ``dictionary_loss``.
         """
-        self.kv = context_tokens = self.adapt_context_encoder(
+        device = bev_features.device
+        bs = bev_features.shape[0]
+
+        # ----------------------------------------------------------------------
+        # 1. BEV/status context tokens from the existing context encoder
+        # ----------------------------------------------------------------------
+        context_tokens = self.adapt_context_encoder(
             bev_features=bev_features,
             radar_logits=None,
             radar_predictions=None,
             data=data,
             log=log,
         )
+        context_tokens = self.context_proj(context_tokens)
 
-        bs = context_tokens.shape[0]
+        # ----------------------------------------------------------------------
+        # 2. History pose extraction and K-disks tokenization
+        # ----------------------------------------------------------------------
+        # Keep all K-disks math in float32 — the codebook centroids are
+        # registered as float32 buffers and autocast can otherwise downcast
+        # ``history_deltas`` to bf16/fp16, leaving ``argmin`` on a mixed-dtype
+        # distance matrix.
+        past_positions = data["past_positions"].to(
+            device=device, non_blocking=True,
+        )[:, : self._num_history_poses, :2].float()
+        past_yaws = data["past_yaws"].to(
+            device=device, non_blocking=True,
+        )[:, : self._num_history_poses].float()
+        history_poses = torch.cat(
+            [past_positions, past_yaws.unsqueeze(-1)], dim=-1,
+        )  # [B, T_hist, 3]
+        T_hist = history_poses.shape[1]
 
-        # =====================================================================
-        # AUTOREGRESSIVE DECODER
-        # =====================================================================
+        history_deltas = self.kdisks_model._compute_deltas(history_poses)
+        kinematic_tokens = self.kdisks_model.encode(history_deltas).view(
+            bs, T_hist - 1,
+        )
+
+        # ----------------------------------------------------------------------
+        # 3. Future tokenization for teacher forcing (training only)
+        # ----------------------------------------------------------------------
+        future_token_ids: torch.Tensor | None = None
+        future_deltas: torch.Tensor | None = None
+        centroids: torch.Tensor | None = None
+        commitment_loss = torch.tensor(0.0, device=device)
+        dictionary_loss = torch.tensor(0.0, device=device)
+
+        if self.training and "future_waypoints" in data:
+            T_future_cfg = self._num_future_poses
+            future_waypoints = data["future_waypoints"].to(
+                device=device, non_blocking=True,
+            )[:, :T_future_cfg, :2].float()
+            future_yaws = data["future_yaws"].to(
+                device=device, non_blocking=True,
+            )[:, :T_future_cfg].float()
+            target_trajectory = torch.cat(
+                [future_waypoints, future_yaws.unsqueeze(-1)], dim=-1,
+            )  # [B, T_future, 3]
+            T_future = target_trajectory.shape[1]
+
+            last_history_pose = history_poses[:, -1:, :]
+            full_future_seq = torch.cat(
+                [last_history_pose, target_trajectory], dim=1,
+            )  # [B, T_future+1, 3]
+            future_deltas = self.kdisks_model._compute_deltas(full_future_seq)
+            future_token_ids = self.kdisks_model.encode(future_deltas).view(
+                bs, T_future,
+            )
+
+            if self.config.use_kdisks:
+                centroids = self.kdisks_model.codebook.centroids
+
+        # ----------------------------------------------------------------------
+        # 4. Build encoder context: BEV/status tokens + history pose embeddings
+        # ----------------------------------------------------------------------
+        history_pose_emb = self.history_pose_proj(history_poses)  # [B, T_hist, D]
+        encoder_context = torch.cat([context_tokens, history_pose_emb], dim=1)
+        context_len = encoder_context.shape[1]
+        pos_ids = torch.arange(context_len, device=device).unsqueeze(0)
+        encoder_context = encoder_context + self.encoder_context_pos_embedding(
+            pos_ids,
+        )
+
+        # ----------------------------------------------------------------------
+        # 5. Autoregressive decode
+        # ----------------------------------------------------------------------
         if self.training and future_token_ids is not None:
             T_future = future_token_ids.shape[1]
 
-            if self._ss_prob > 0:
-                # =============================================================
-                # SCHEDULED SAMPLING: step-by-step, coin-flip GT vs predicted
-                # =============================================================
-                generated_tokens = kinematic_tokens.clone()  # [B, T_hist-1]
-                all_logits_list = []
-                all_hidden_list = []
+            if self._ss_prob > 0.0:
+                # ---- Scheduled sampling: step-by-step, coin-flip GT vs pred --
+                generated_tokens = kinematic_tokens.clone()
+                all_logits_list: list[torch.Tensor] = []
+                all_hidden_list: list[torch.Tensor] = []
 
                 for t in range(T_future):
                     seq_len = generated_tokens.shape[1]
                     causal_mask = generate_causal_mask(seq_len, device)
 
-                    decoder_output = self.Decoder(
+                    decoder_output = self.transformer_decoder(
                         tgt_token_ids=generated_tokens,
-                        encoder_output=context_tokens,
+                        encoder_output=encoder_context,
                         self_attention_mask=causal_mask,
                     )
 
                     all_hidden_list.append(decoder_output[:, -1:, :])
-                    last_logits = self.output_projection(decoder_output[:, -1:, :])
+                    last_logits = self.output_projection(
+                        decoder_output[:, -1:, :],
+                    )
                     all_logits_list.append(last_logits)
 
-                    # Pick next input token: GT or model's own prediction
                     if t < T_future - 1:
-                        predicted_token = last_logits.argmax(dim=-1)       # [B, 1]
-                        gt_token = future_token_ids[:, t:t+1]             # [B, 1]
-                        use_pred = (torch.rand(B, 1, device=device) < self._ss_prob).long()
-                        next_token = use_pred * predicted_token + (1 - use_pred) * gt_token
+                        predicted_token = last_logits.argmax(dim=-1)
+                        gt_token = future_token_ids[:, t : t + 1]
+                        use_pred = (
+                            torch.rand(bs, 1, device=device) < self._ss_prob
+                        ).long()
+                        next_token = (
+                            use_pred * predicted_token + (1 - use_pred) * gt_token
+                        )
                     else:
                         next_token = last_logits.argmax(dim=-1)
 
-                    generated_tokens = torch.cat([generated_tokens, next_token], dim=1)
+                    generated_tokens = torch.cat(
+                        [generated_tokens, next_token], dim=1,
+                    )
 
-                output_logits = torch.cat(all_logits_list, dim=1)          # [B, T_future, V]
-                future_hidden_states = torch.cat(all_hidden_list, dim=1)   # [B, T_future, D]
-
+                output_logits = torch.cat(all_logits_list, dim=1)
+                future_hidden_states = torch.cat(all_hidden_list, dim=1)
             else:
-                # =============================================================
-                # PURE TEACHER FORCING (fast parallel path, early epochs)
-                # =============================================================
-                decoder_input_tokens = torch.cat([
-                    kinematic_tokens,                    # [B, T_hist-1]
-                    future_token_ids[:, :-1]             # [B, T_future-1]
-                ], dim=1)
-
+                # ---- Pure teacher forcing (parallel) -------------------------
+                decoder_input_tokens = torch.cat(
+                    [kinematic_tokens, future_token_ids[:, :-1]], dim=1,
+                )
                 seq_len = decoder_input_tokens.shape[1]
                 causal_mask = generate_causal_mask(seq_len, device)
 
-                decoder_output = self.Decoder(
+                decoder_output = self.transformer_decoder(
                     tgt_token_ids=decoder_input_tokens,
-                    encoder_output=context_tokens,
+                    encoder_output=encoder_context,
                     self_attention_mask=causal_mask,
                 )
-
                 all_logits = self.output_projection(decoder_output)
                 num_history_tokens = kinematic_tokens.shape[1]
-                output_logits = all_logits[:, num_history_tokens - 1:, :]
-
-                future_hidden_states = decoder_output[:, num_history_tokens - 1:, :]
-
+                output_logits = all_logits[:, num_history_tokens - 1 :, :]
+                future_hidden_states = decoder_output[
+                    :, num_history_tokens - 1 :, :
+                ]
         else:
-            # -----------------------------------------------------------------
-            # AUTOREGRESSIVE INFERENCE (validation / test)
-            # -----------------------------------------------------------------
-            T_future = self._config.num_poses  # 8
-
-            generated_tokens = kinematic_tokens.clone()  # [B, T_hist-1]
-
+            # ---- AR inference (validation / test) ---------------------------
+            T_future = self._num_future_poses
+            generated_tokens = kinematic_tokens.clone()
             all_logits_list = []
             all_hidden_list = []
 
-            for t in range(T_future):
+            for _ in range(T_future):
                 seq_len = generated_tokens.shape[1]
                 causal_mask = generate_causal_mask(seq_len, device)
 
-                decoder_output = self.Decoder(
+                decoder_output = self.transformer_decoder(
                     tgt_token_ids=generated_tokens,
-                    encoder_output=context_tokens,
+                    encoder_output=encoder_context,
                     self_attention_mask=causal_mask,
                 )
-
                 all_hidden_list.append(decoder_output[:, -1:, :])
                 last_logits = self.output_projection(decoder_output[:, -1:, :])
                 all_logits_list.append(last_logits)
 
-                next_token = last_logits.argmax(dim=-1)  # [B, 1]
-                generated_tokens = torch.cat([generated_tokens, next_token], dim=1)
+                next_token = last_logits.argmax(dim=-1)
+                generated_tokens = torch.cat(
+                    [generated_tokens, next_token], dim=1,
+                )
 
-            output_logits = torch.cat(all_logits_list, dim=1)  # [B, T_future, vocab_size]
-            future_hidden_states = torch.cat(all_hidden_list, dim=1)  # [B, T_future, D]
+            output_logits = torch.cat(all_logits_list, dim=1)
+            future_hidden_states = torch.cat(all_hidden_list, dim=1)
 
-        # =====================================================================
-        # TRAJECTORY HEAD: concatenated hidden states → full trajectory at once
-        # Preserves temporal ordering while predicting all poses jointly
-        # =====================================================================
-        concat_hidden = future_hidden_states.reshape(B, -1)  # [B, T_future * D]
-        trajectory_flat = self._trajectory_head(concat_hidden)  # [B, num_poses * 3]
-        trajectory_raw = trajectory_flat.reshape(B, self._config.num_poses, 3)
+        # ----------------------------------------------------------------------
+        # 6. Trajectory head — concat hidden states → (x, y, heading)
+        # ----------------------------------------------------------------------
+        concat_hidden = future_hidden_states.reshape(bs, -1)
+        trajectory_flat = self._trajectory_head(concat_hidden)
+        trajectory_raw = trajectory_flat.reshape(bs, self._num_future_poses, 3)
         heading = trajectory_raw[..., 2:3].tanh() * np.pi
-        trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)  # [B, T_future, 3]
+        trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)
 
-        return (
-            trajectory,
-            # route,
-            # waypoints,
-            # target_speed_dist,
-            # target_speed_scalar,
-            # headings.squeeze(-1) if headings is not None else None,
+        # If we are not training (no GT future), populate ``future_token_ids``
+        # with the AR samples so the dataclass contract is honoured. These are
+        # not used for any loss in that mode.
+        if future_token_ids is None:
+            future_token_ids = output_logits.argmax(dim=-1)
+
+        return AdaptDecoderOutput(
+            pred_future_waypoints=trajectory[..., :2],
+            pred_headings=trajectory[..., 2],
+            trajectory=trajectory,
+            output_logits=output_logits,
+            future_token_ids=future_token_ids,
+            future_deltas=future_deltas,
+            centroids=centroids,
+            kinematic_tokens=kinematic_tokens,
+            commitment_loss=commitment_loss,
+            dictionary_loss=dictionary_loss,
         )
 
     @beartype
@@ -532,6 +622,46 @@ class AdaptDecoder(nn.Module):
                 pred_token_ids = output_logits.argmax(dim=-1)
                 token_accuracy = (pred_token_ids == future_token_ids).float().mean()
             log["metric/token_accuracy"] = token_accuracy.item()
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding (Vaswani et al., 2017).
+
+    Ported verbatim from ADAPT's :mod:`temporal_transformer` so the AR decoder
+    drop-in matches the NavSim implementation.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000) -> None:
+        super().__init__()
+        self.d_model = d_model
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model),
+        )
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1)]
+
+
+class FeedForward(nn.Module):
+    """GELU MLP used inside the decoder layers (ported from ADAPT)."""
+
+    def __init__(self, d_model: int, ffn_hidden: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, ffn_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, ffn_hidden, num_heads, drop_prob, use_separable_conv=False):

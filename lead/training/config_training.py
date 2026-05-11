@@ -681,6 +681,56 @@ class TrainingConfig(BaseConfig):
     # If true model will use the planning decoder.
     use_planning_decoder = False
 
+    # --- ADAPT autoregressive decoder ---
+    # If true the model will use the ADAPT autoregressive kinematic-token
+    # decoder instead of (or alongside) the planning decoder. Mutually
+    # exclusive with ``use_planning_decoder`` in normal usage; both can
+    # coexist transiently if a closed-loop deployment still needs the
+    # speed/route heads from PlanningDecoder.
+    use_adapt_decoder = False
+    # Path to the K-disks vocabulary pickle produced by
+    # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
+    kdisks_vocab_path = "lead/adapt/codebooks/kdisks_carla.pkl"
+    # Whether to use K-disks (fixed clustering codebook) vs VQ-VAE.
+    use_kdisks = True
+    # Heading weight for the K-disks distance metric.
+    kdisks_heading_weight = 1.0
+    # Whether to normalize delta statistics inside KDisksModel.
+    normalize_kinematics = False
+    # If true use Gaussian-soft cross-entropy against the K-disks centroids
+    # instead of hard one-hot CE on token indices.
+    use_soft_ce = False
+    # Soft CE Gaussian std in delta space (smaller = sharper targets).
+    soft_ce_sigma = 0.1
+    # Floor probability for soft CE numerical stability.
+    soft_ce_min_prob = 1e-6
+    # Codebook size — must match the .pkl file produced by the clustering script.
+    kinematic_vocab_size = 4096
+    # Decoder embedding dim. Must equal transfuser_token_dim unless a
+    # context_proj is added in AdaptDecoder.__init__.
+    kinematic_embed_dim = 256
+    # Decoder feed-forward hidden width.
+    decoder_ffn_dim = 1024
+    # Number of heads in the AR decoder self/cross attention.
+    decoder_num_heads = 8
+    # Dropout in the AR decoder.
+    decoder_dropout = 0.1
+    # Number of stacked decoder layers.
+    decoder_num_layers = 6
+    # Max sequence length for the decoder positional encoding (history + future tokens).
+    max_sequence_length = 64
+    # Smoothing for the soft Fréchet trajectory loss.
+    frechet_gamma = 0.1
+    # Number of past frames to feed into the AR decoder context as history poses.
+    # Used to derive history kinematic tokens via K-disks. Should be > 1 because
+    # T_hist - 1 deltas are produced.
+    num_history_poses = 5
+    # If true the CARLA dataloader will surface past_positions / past_yaws /
+    # past_speeds into ``data`` for the model (normally consumed only during
+    # bucket-building). Gated separately from ``use_past_positions`` because
+    # ADAPT needs them regardless of the planning decoder's own status branch.
+    use_history_poses = False
+
     @property
     def target_speed_classes(self):
         """Carla target speed prediction classes in m/s."""
@@ -985,6 +1035,24 @@ class TrainingConfig(BaseConfig):
             weights["loss_spatio_temporal_waypoints"] = 0.0
             weights["loss_spatial_route"] = 0.0
             weights["loss_target_speed"] = 0.0
+
+        # ADAPT autoregressive decoder losses (no source-dataset prefix:
+        # ADAPT uses the same loss keys irrespective of dataset).
+        weights.update(
+            {
+                "loss_trajectory": 1.0,
+                "loss_soft_frechet": 1.0,
+                "loss_kinematic_token": 1.0,
+                "loss_commitment": 0.25,
+                "loss_dictionary": 0.25,
+            },
+        )
+        if not self.use_adapt_decoder:
+            weights["loss_trajectory"] = 0.0
+            weights["loss_soft_frechet"] = 0.0
+            weights["loss_kinematic_token"] = 0.0
+            weights["loss_commitment"] = 0.0
+            weights["loss_dictionary"] = 0.0
 
         return weights
 

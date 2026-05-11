@@ -364,7 +364,11 @@ class CARLAData(Dataset):
         data["scenario_type_id"] = constants.SCENARIO_TYPES.index(data["scenario_type"])
 
         # Waypoints
-        if self.config.use_planning_decoder or self.config.visualize_dataset:
+        if (
+            self.config.use_planning_decoder
+            or self.config.use_adapt_decoder
+            or self.config.visualize_dataset
+        ):
             future_positions = meta.get("future_positions")
             future_yaws = meta.get("future_yaws")
             future_waypoints = np.array(
@@ -392,6 +396,49 @@ class CARLAData(Dataset):
                     future_yaws,
                     yaw_perturbation=perturbation_rotation,
                 )
+
+        # History poses (for ADAPT autoregressive kinematic tokenization).
+        # The CARLA expert meta files store ``past_positions`` (shape [N, 2])
+        # and ``past_yaws`` (shape [N]) in ego-current frame, ordered
+        # newest → oldest (index 0 is the current frame at the origin).
+        # We sample ``num_history_poses`` frames at ``waypoints_spacing``
+        # (reusing ``past_waypoint_indices`` already built above) and reorder
+        # to oldest → newest so the decoder's delta computation
+        # ``poses[1:] - poses[:-1]`` produces forward-time deltas.
+        if (
+            (self.config.use_history_poses or self.config.use_adapt_decoder)
+            and not self.build_cache
+            and not self.build_buckets
+        ):
+            past_positions_raw = meta["past_positions"]
+            past_yaws_raw = meta["past_yaws"]
+            n_hist = self.config.num_history_poses
+            hist_indices = list(reversed(past_waypoint_indices[:n_hist]))
+            past_positions = np.array(
+                [
+                    past_positions_raw[i][:2]
+                    for i in hist_indices
+                    if i < len(past_positions_raw)
+                ],
+                dtype=np.float32,
+            ).reshape(-1, 2)
+            past_yaws = np.array(
+                [
+                    past_yaws_raw[i]
+                    for i in hist_indices
+                    if i < len(past_yaws_raw)
+                ],
+                dtype=np.float32,
+            ).reshape(-1)
+            data["past_positions"] = carla_dataset_utils.perturbate_waypoints(
+                past_positions,
+                y_perturbation=perturbation_translation,
+                yaw_perturbation=perturbation_rotation,
+            )
+            data["past_yaws"] = carla_dataset_utils.perturbate_yaws(
+                past_yaws,
+                yaw_perturbation=perturbation_rotation,
+            )
 
         # Route and target speed features
         if (
