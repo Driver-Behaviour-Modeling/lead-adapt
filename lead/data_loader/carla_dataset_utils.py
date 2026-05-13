@@ -20,7 +20,7 @@ from lead.common.constants import (
     TransfuserSemanticSegmentationClass,
 )
 from lead.data_loader.training_cache import SensorData
-from lead.tfv6 import center_net_decoder as g_t
+from lead.adapt import center_net_decoder as g_t
 from lead.training.config_training import TrainingConfig
 
 LOG = logging.getLogger(__name__)

@@ -507,10 +507,13 @@ class AdaptDecoder(nn.Module):
         if future_token_ids is None:
             future_token_ids = output_logits.argmax(dim=-1)
 
+        # Cast user-facing outputs to fp32 — autocast may have produced bf16,
+        # which downstream consumers (visualizer .numpy() in particular) reject.
+        trajectory_fp32 = trajectory.float()
         return AdaptDecoderOutput(
-            pred_future_waypoints=trajectory[..., :2],
-            pred_headings=trajectory[..., 2],
-            trajectory=trajectory,
+            pred_future_waypoints=trajectory_fp32[..., :2],
+            pred_headings=trajectory_fp32[..., 2],
+            trajectory=trajectory_fp32,
             output_logits=output_logits,
             future_token_ids=future_token_ids,
             future_deltas=future_deltas,
@@ -541,33 +544,51 @@ class AdaptDecoder(nn.Module):
             loss: Mutable loss dict — each term added under its own key.
             log: Mutable log dict for metrics.
         """
+        # CARLA dataloader omits both keys when a sample has no valid future
+        # trajectory (end-of-route, post-collision, etc.). Skip trajectory
+        # terms for that batch; the token-CE and codebook losses below still
+        # contribute gradients to the decoder.
+        has_trajectory_gt = (
+            "future_waypoints" in data and "future_yaws" in data
+        )
+
         with torch.amp.autocast(device_type="cuda", enabled=False):
             num_steps = self.config.num_way_points_prediction
 
-            waypoints_label = data["future_waypoints"].to(
-                self.device,
-                dtype=self.config.torch_float_type,
-                non_blocking=True,
-            )[:, :num_steps].float()
-            heading_label = data["future_yaws"].to(
-                self.device,
-                dtype=self.config.torch_float_type,
-                non_blocking=True,
-            )[:, :num_steps].float()
-            gt_traj = torch.cat(
-                [waypoints_label, heading_label.unsqueeze(-1)], dim=-1,
-            )  # [B, T, 3]
-
             pred_traj = decoder_outputs["trajectory"][:, :num_steps].float()
 
-            loss["loss_trajectory"] = _rotated_l1_loss(
-                pred_traj, gt_traj, lat_weight=5.0,
-            )
-            loss["loss_soft_frechet"] = _soft_frechet_loss(
-                pred_traj[..., :2],
-                gt_traj[..., :2],
-                gamma=self.config.frechet_gamma,
-            )
+            if has_trajectory_gt:
+                waypoints_label = data["future_waypoints"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                )[:, :num_steps].float()
+                heading_label = data["future_yaws"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                )[:, :num_steps].float()
+                gt_traj = torch.cat(
+                    [waypoints_label, heading_label.unsqueeze(-1)], dim=-1,
+                )  # [B, T, 3]
+
+                loss["loss_trajectory"] = _rotated_l1_loss(
+                    pred_traj, gt_traj, lat_weight=5.0,
+                )
+                loss["loss_soft_frechet"] = _soft_frechet_loss(
+                    pred_traj[..., :2],
+                    gt_traj[..., :2],
+                    gamma=self.config.frechet_gamma,
+                )
+            else:
+                # No GT this batch — keep the trajectory head in the autograd
+                # graph anyway, so DDP sees its params as used every iteration
+                # (avoids the unused-params / dynamic-graph error class).
+                # ``sum() * 0`` contributes zero to the optimised loss but
+                # routes a zero gradient back through ``_trajectory_head``.
+                zero_loss = pred_traj.sum() * 0.0
+                loss["loss_trajectory"] = zero_loss
+                loss["loss_soft_frechet"] = zero_loss
 
             output_logits = decoder_outputs["output_logits"].float()
             future_token_ids = decoder_outputs["future_token_ids"]
@@ -606,17 +627,18 @@ class AdaptDecoder(nn.Module):
             "iteration" in data
             and ((data["iteration"] + 1) % self.config.log_scalars_frequency) == 0
         ):
-            pred_waypoints = decoder_outputs["pred_future_waypoints"]
-            pred_headings = decoder_outputs["pred_headings"]
-            log["metric/waypoints_ade"] = common_utils.average_displacement_error(
-                pred_waypoints, waypoints_label,
-            )
-            log["metric/waypoints_fde"] = common_utils.final_displacement_error(
-                pred_waypoints, waypoints_label,
-            )
-            log["metric/heading_ade"] = common_utils.average_displacement_error(
-                pred_headings, heading_label,
-            )
+            if has_trajectory_gt:
+                pred_waypoints = decoder_outputs["pred_future_waypoints"]
+                pred_headings = decoder_outputs["pred_headings"]
+                log["metric/waypoints_ade"] = common_utils.average_displacement_error(
+                    pred_waypoints, waypoints_label,
+                )
+                log["metric/waypoints_fde"] = common_utils.final_displacement_error(
+                    pred_waypoints, waypoints_label,
+                )
+                log["metric/heading_ade"] = common_utils.average_displacement_error(
+                    pred_headings, heading_label,
+                )
 
             with torch.no_grad():
                 pred_token_ids = output_logits.argmax(dim=-1)

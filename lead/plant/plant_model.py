@@ -9,13 +9,13 @@ from torch import nn
 from lead.plant.plant_backbone import PlantBackbone
 from lead.plant.plant_config import PlantConfig
 from lead.plant.plant_planning_decoder import PlantPlanningDecoder
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.adapt import Prediction
 
 
 class PlantModel(nn.Module):
     """PlanT model: object token backbone + planning decoder.
 
-    Drop-in replacement for :class:`~lead.tfv6.tfv6.TFv6`.  Composes
+    Drop-in replacement for :class:`~lead.adapt.adapt.TFv6`.  Composes
     :class:`PlantBackbone` (BERT encoder) with :class:`PlantPlanningDecoder`
     (reuses LEAD's planning heads and losses).
     """

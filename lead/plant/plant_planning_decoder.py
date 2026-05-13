@@ -4,7 +4,7 @@ import jaxtyping as jt
 import torch
 from beartype import beartype
 
-from lead.tfv6.planning_decoder import PlanningDecoder, decode_two_hot
+from lead.adapt.planning_decoder import PlanningDecoder, decode_two_hot
 from lead.training.config_training import TrainingConfig
 
 

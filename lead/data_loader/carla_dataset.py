@@ -430,6 +430,7 @@ class CARLAData(Dataset):
                 ],
                 dtype=np.float32,
             ).reshape(-1)
+
             data["past_positions"] = carla_dataset_utils.perturbate_waypoints(
                 past_positions,
                 y_perturbation=perturbation_translation,

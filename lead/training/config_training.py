@@ -304,7 +304,7 @@ class TrainingConfig(BaseConfig):
     @property
     def is_pretraining(self):
         """If true indicates pretraining phase."""
-        return not self.use_planning_decoder
+        return not (self.use_planning_decoder or self.use_adapt_decoder)
 
     # --- Training speed and memory optimization ---
     # Number of data loader workers to prefetch batches.

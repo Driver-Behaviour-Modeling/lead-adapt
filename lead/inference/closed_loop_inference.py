@@ -9,7 +9,7 @@ from lead.common.pid_controller import LateralPIDController, PIDController, get_
 from lead.expert.config_expert import ExpertConfig
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopInference, OpenLoopPrediction
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.adapt import Prediction
 from lead.training.config_training import TrainingConfig
 
 np.set_printoptions(suppress=True)

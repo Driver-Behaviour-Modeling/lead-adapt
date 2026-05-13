@@ -13,7 +13,7 @@ from beartype import beartype
 from numpy.typing import NDArray
 
 from lead.plant.plant_config import PlantConfig
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.adapt import Prediction
 
 # Object type -> (fill_color, outline_color) in BGR
 _OBJECT_COLORS: dict[int, tuple[tuple[int, int, int], tuple[int, int, int]]] = {

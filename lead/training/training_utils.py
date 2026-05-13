@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 from lead.data_loader.carla_dataset import CARLAData
 from lead.data_loader.navsim_dataset import NavsimData
 from lead.data_loader.waymo_e2e_dataset import WODE2EData
-from lead.tfv6 import transfuser_utils as fn
+from lead.adapt import transfuser_utils as fn
 from lead.training import mixed_training_utils
 from lead.training.config_training import TrainingConfig
 
@@ -73,7 +73,7 @@ def create_model(config: TrainingConfig) -> torch.nn.Module:
         from lead.adapt.adapt import TFv6 as AdaptModel
 
         return AdaptModel(config.device, config)
-    from lead.tfv6.tfv6 import TFv6
+    from lead.adapt.adapt import TFv6
 
     return TFv6(config.device, config)
 
@@ -428,11 +428,13 @@ def set_start_method():
     # Select how the threads in the data loader are spawned
     # See this: https://stackoverflow.com/a/66113051
     # To edit code while processes run, we generally prefer fork.
+    # `force=True` because torch/transformers imports may have already initialised
+    # the default multiprocessing context by the time this is called.
     available_start_methods = mp.get_all_start_methods()
     if "fork" in available_start_methods:
-        mp.set_start_method("fork")
+        mp.set_start_method("fork", force=True)
     # Available on all OS.
     elif "spawn" in available_start_methods:
-        mp.set_start_method("spawn")
+        mp.set_start_method("spawn", force=True)
     elif "forkserver" in available_start_methods:
-        mp.set_start_method("forkserver")
+        mp.set_start_method("forkserver", force=True)

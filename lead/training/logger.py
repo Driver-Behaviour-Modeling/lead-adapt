@@ -8,10 +8,13 @@ from beartype import beartype
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
+from lead.adapt.adapt import Prediction as AdaptPrediction
 from lead.plant.plant_visualizer import visualize_plant_sample
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.adapt import Prediction as Tfv6Prediction
 from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import visualize_sample
+
+Prediction = Tfv6Prediction | AdaptPrediction
 
 LOG = logging.getLogger(__name__)
 

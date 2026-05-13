@@ -15,7 +15,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from lead.common.constants import SourceDataset
-from lead.tfv6.tfv6 import TFv6
+from lead.adapt.adapt import TFv6
 from lead.training.config_training import TrainingConfig
 from lead.training.rfs import compute_rfs
 
@@ -281,7 +281,7 @@ def upsample_trajectory(
 @beartype
 def evaluate_waymo_e2e(model: TFv6, config: TrainingConfig) -> float:
     """Evaluate the model on the Waymo E2E validation set and return the RFM score."""
-    from lead.tfv6.tfv6 import Prediction
+    from lead.adapt.adapt import Prediction
 
     dataset = WODE2EData(
         root=config.waymo_e2e_val_data_root,
@@ -321,7 +321,7 @@ def evaluate_waymo_e2e(model: TFv6, config: TrainingConfig) -> float:
 
 
 if __name__ == "__main__":
-    from lead.tfv6.tfv6 import TFv6
+    from lead.adapt.adapt import TFv6
 
     config = TrainingConfig()
     config.LTF = True

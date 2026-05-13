@@ -22,8 +22,8 @@ from lead.data_loader import carla_dataset_utils
 from lead.inference.closed_loop_inference import ClosedLoopPrediction
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopPrediction
-from lead.tfv6.center_net_decoder import PredictedBoundingBox
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.center_net_decoder import PredictedBoundingBox
+from lead.adapt.adapt import Prediction
 from lead.training.config_training import TrainingConfig
 from lead.visualization import viz_utils
 
@@ -1567,7 +1567,13 @@ def visualize_feature_maps(
             "Route",
             "hot",
         ),
-        (data.get("radar")[0].cpu().numpy(), "Radar Input", "hot"),
+        (
+            data.get("radar")[0].cpu().numpy()
+            if data.get("radar") is not None
+            else None,
+            "Radar Input",
+            "hot",
+        ),
         (data.get("radar_detections"), "Radar Detection Label", "hot"),
         (predictions.pred_radar_predictions, "Radar Detection Prediction", "hot"),
     ]

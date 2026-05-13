@@ -48,6 +48,11 @@ warnings.filterwarnings(
     category=ResourceWarning,
     message="Implicitly cleaning up.*TemporaryDirectory.*",
 )
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=".*cuDNN SDPA backward got grad_output\\.strides\\(\\) != output\\.strides\\(\\).*",
+)
 
 
 class Trainer:

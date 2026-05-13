@@ -9,7 +9,7 @@ import lead.common.common_utils as common_utils
 from lead.common.constants import (
     TransfuserBoundingBoxIndex,
 )
-from lead.tfv6 import center_net_decoder as g_t
+from lead.adapt import center_net_decoder as g_t
 from lead.training.config_training import TrainingConfig
 
 

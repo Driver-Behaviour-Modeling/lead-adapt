@@ -14,9 +14,9 @@ from lead.common.constants import TransfuserBoundingBoxIndex
 from lead.data_loader import carla_dataset_utils
 from lead.inference import inference_utils
 from lead.inference.config_open_loop import OpenLoopConfig
-from lead.tfv6.center_net_decoder import PredictedBoundingBox
-from lead.tfv6.planning_decoder import decode_two_hot
-from lead.tfv6.tfv6 import Prediction
+from lead.adapt.center_net_decoder import PredictedBoundingBox
+from lead.adapt.planning_decoder import decode_two_hot
+from lead.adapt.adapt import Prediction
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
 

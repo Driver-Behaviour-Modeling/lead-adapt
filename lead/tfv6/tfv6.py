@@ -9,15 +9,15 @@ from beartype import beartype
 from torch import nn
 
 from lead.common.constants import SourceDataset
-from lead.tfv6.bev_decoder import BEVDecoder
-from lead.tfv6.center_net_decoder import (
+from lead.adapt.bev_decoder import BEVDecoder
+from lead.adapt.center_net_decoder import (
     CenterNetBoundingBoxPrediction,
     CenterNetDecoder,
 )
-from lead.tfv6.perspective_decoder import PerspectiveDecoder
-from lead.tfv6.planning_decoder import PlanningDecoder
-from lead.tfv6.radar_detector import RadarDetector
-from lead.tfv6.transfuser_backbone import TransfuserBackbone
+from lead.adapt.perspective_decoder import PerspectiveDecoder
+from lead.adapt.planning_decoder import PlanningDecoder
+from lead.adapt.radar_detector import RadarDetector
+from lead.adapt.transfuser_backbone import TransfuserBackbone
 from lead.training.config_training import TrainingConfig
 
 

@@ -21,7 +21,7 @@ from lead.common.constants import (
     TransfuserBoundingBoxIndex,
 )
 from lead.data_loader import carla_dataset_utils
-from lead.tfv6 import transfuser_utils as fn
+from lead.adapt import transfuser_utils as fn
 from lead.training.config_training import TrainingConfig
 
 
