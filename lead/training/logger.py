@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from lead.adapt.adapt import Prediction as AdaptPrediction
 from lead.plant.plant_visualizer import visualize_plant_sample
-from lead.adapt.adapt import Prediction as Tfv6Prediction
+from lead.tfv6.tfv6 import Prediction as Tfv6Prediction
 from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import visualize_sample
 

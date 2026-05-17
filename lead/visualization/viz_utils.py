@@ -7,7 +7,7 @@ import numpy.typing as npt
 from beartype import beartype
 
 from lead.common.constants import TransfuserBoundingBoxIndex
-from lead.tfv6.center_net_decoder import PredictedBoundingBox
+from lead.adapt.center_net_decoder import PredictedBoundingBox
 
 
 @beartype

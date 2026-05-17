@@ -95,8 +95,15 @@ class OpenLoopInference:
             pred_target_speed_distribution
         ) = pred_future_headings = None
 
-        if self.config_training.use_planning_decoder:
-            if self.config_training.predict_target_speed:
+        has_any_planner = (
+            self.config_training.use_planning_decoder
+            or getattr(self.config_training, "use_adapt_decoder", False)
+        )
+        if has_any_planner:
+            if (
+                self.config_training.use_planning_decoder
+                and self.config_training.predict_target_speed
+            ):
                 pred_target_speed_logits = torch.stack(
                     [pred.pred_target_speed_distribution[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average target speed logits.
@@ -122,20 +129,22 @@ class OpenLoopInference:
                         self.config_open_loop.lower_target_speed_factor
                     )
 
-            if self.config_training.predict_temporal_spatial_waypoints:
+            # Waypoints are produced by both PlanningDecoder and AdaptDecoder.
+            if predictions[0].pred_future_waypoints is not None:
                 pred_future_waypoints = torch.stack(
                     [pred.pred_future_waypoints[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average waypoints.
 
-            if self.config_training.predict_spatial_path:
+            if (
+                self.config_training.use_planning_decoder
+                and self.config_training.predict_spatial_path
+            ):
                 pred_routes = torch.stack(
                     [pred.pred_route[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average route.
 
-            if (
-                self.config_training.use_navsim_data
-                and predictions[0].pred_headings is not None
-            ):
+            # Headings come from PlanningDecoder (NavSim only) or AdaptDecoder.
+            if predictions[0].pred_headings is not None:
                 pred_future_headings = torch.stack(
                     [pred.pred_headings[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average headings.

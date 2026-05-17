@@ -206,10 +206,15 @@ class ClosedLoopInference(OpenLoopInference):
         ego_speed = data["speed"].to(self.device, dtype=torch.float32).unsqueeze(1)
         open_loop_prediction: OpenLoopPrediction = super().ensemble(data, predictions)
 
-        # Convert high-level commands to vehicle controls
+        # Convert high-level commands to vehicle controls.
+        # Note: both singular (waypoint_*) and plural (waypoints_*) names exist
+        # below — the singular set is unused but kept for backwards compat with
+        # ``ClosedLoopPrediction`` field names; the plural set is what the
+        # modality dispatch actually reads.
         steer = throttle = brake = waypoint_steer = waypoint_throttle = (
             waypoint_brake
         ) = route_steer = target_speed_throttle = target_speed_brake = None
+        waypoints_steer = waypoints_throttle = waypoints_brake = None
 
         if open_loop_prediction.pred_route is not None:
             route_steer, target_speed_throttle, target_speed_brake = (

@@ -484,6 +484,36 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 dtype=torch.float32,
             )[None]
 
+        # ADAPT decoder needs a fixed-length history of ego poses, sampled at the
+        # same cadence (waypoints_spacing) the dataloader used at training time.
+        # ``ego_past_positions`` and ``ego_past_yaws`` are tick-by-tick queues in
+        # the current-ego frame, oldest → newest. Subsample at ``waypoints_spacing``
+        # and front-pad with the oldest available entry if the queue hasn't filled
+        # yet (early ticks of an episode).
+        if getattr(self.training_config, "use_adapt_decoder", False):
+            n_hist = self.training_config.num_history_poses
+            stride = self.training_config.waypoints_spacing
+            positions = np.array(self.ego_past_positions, dtype=np.float32)  # [N, 2]
+            yaws = np.array(self.ego_past_yaws, dtype=np.float32)  # [N]
+            sampled_pos = positions[::-1][::stride][:n_hist][::-1]  # oldest → newest
+            sampled_yaw = yaws[::-1][::stride][:n_hist][::-1]
+            pad_n = n_hist - sampled_pos.shape[0]
+            if pad_n > 0:
+                if sampled_pos.shape[0] > 0:
+                    pos_pad = np.tile(sampled_pos[0:1, :], (pad_n, 1))
+                    yaw_pad = np.tile(sampled_yaw[0:1], pad_n)
+                else:
+                    pos_pad = np.zeros((pad_n, 2), dtype=np.float32)
+                    yaw_pad = np.zeros((pad_n,), dtype=np.float32)
+                sampled_pos = np.concatenate([pos_pad, sampled_pos], axis=0)
+                sampled_yaw = np.concatenate([yaw_pad, sampled_yaw], axis=0)
+            input_data_tensors["past_positions"] = (
+                torch.from_numpy(sampled_pos).to(self.device, dtype=torch.float32)[None]
+            )
+            input_data_tensors["past_yaws"] = (
+                torch.from_numpy(sampled_yaw).to(self.device, dtype=torch.float32)[None]
+            )
+
         # Save input log if need
         if (
             self.config_closed_loop.save_path is not None
@@ -577,7 +607,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 "route_curvature": torch.Tensor(
                     [
                         common_utils.waypoints_curvature(
-                            closed_loop_prediction.pred_route.squeeze(),
+                            (
+                                closed_loop_prediction.pred_route
+                                if closed_loop_prediction.pred_route is not None
+                                else closed_loop_prediction.pred_future_waypoints
+                            ).squeeze(),
                         ),
                     ],
                 ),
