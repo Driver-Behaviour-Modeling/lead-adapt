@@ -1030,11 +1030,18 @@ class TrainingConfig(BaseConfig):
             },
         )
 
-        # Disable planning losses during pretraining
-        if not self.use_planning_decoder:
+        # Disable planning losses during pretraining. ADAPT also emits
+        # ``loss_target_speed`` and ``loss_spatial_route`` from its dedicated
+        # heads, so keep those active whenever either decoder is in use.
+        if not (self.use_planning_decoder or self.use_adapt_decoder):
             weights["loss_spatio_temporal_waypoints"] = 0.0
             weights["loss_spatial_route"] = 0.0
             weights["loss_target_speed"] = 0.0
+        elif not self.use_planning_decoder:
+            # ADAPT-only path: the spatio-temporal-waypoint loss is supplied by
+            # the planning decoder's L1 term, not ADAPT (ADAPT uses
+            # ``loss_trajectory`` / ``loss_soft_frechet`` instead). Disable it.
+            weights["loss_spatio_temporal_waypoints"] = 0.0
 
         # ADAPT autoregressive decoder losses (no source-dataset prefix:
         # ADAPT uses the same loss keys irrespective of dataset).

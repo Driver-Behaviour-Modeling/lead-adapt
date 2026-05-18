@@ -46,6 +46,9 @@ class AdaptDecoderOutput(TypedDict):
 
     pred_future_waypoints: jt.Float[torch.Tensor, "B n_waypoints 2"]
     pred_headings: jt.Float[torch.Tensor, "B n_waypoints"]
+    pred_route: jt.Float[torch.Tensor, "B n_checkpoints 2"]
+    pred_target_speed_distribution: jt.Float[torch.Tensor, "B num_speed_classes"]
+    pred_target_speed_scalar: jt.Float[torch.Tensor, " B"]
     trajectory: jt.Float[torch.Tensor, "B n_waypoints 3"]
     output_logits: jt.Float[torch.Tensor, "B n_waypoints V"]
     future_token_ids: jt.Int[torch.Tensor, "B n_waypoints"]
@@ -286,6 +289,38 @@ class AdaptDecoder(nn.Module):
             nn.Linear(config.decoder_ffn_dim, self._num_future_poses * 3),
         )
 
+        # Target-speed head — mirrors TFv6's PlanningDecoder.target_speed_decoder
+        # (two-layer MLP → two-hot bin logits) but reads the concatenated AR
+        # hidden states instead of a dedicated slot query. Restores the
+        # ``throttle_modality="target_speed"`` / ``brake_modality="target_speed"``
+        # control contract that LEAD's closed-loop PID expects.
+        self._target_speed_decoder = nn.Sequential(
+            nn.Linear(
+                config.kinematic_embed_dim * self._num_future_poses,
+                config.decoder_ffn_dim,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Linear(
+                config.decoder_ffn_dim,
+                len(config.target_speed_classes),
+            ),
+        )
+
+        # Route head — mirrors TFv6's PlanningDecoder.route_decoder (per-step
+        # delta + cumsum) so ``steer_modality="route"`` can also work for ADAPT.
+        # Reads the same concatenated hidden states as the trajectory head,
+        # projects to ``num_route_points_prediction × 2`` deltas, and integrates
+        # in time.
+        self._num_route_checkpoints = config.num_route_points_prediction
+        self._route_decoder = nn.Sequential(
+            nn.Linear(
+                config.kinematic_embed_dim * self._num_future_poses,
+                config.decoder_ffn_dim,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Linear(config.decoder_ffn_dim, self._num_route_checkpoints * 2),
+        )
+
         # Scheduled-sampling probability — bumped by the training loop if used.
         self._ss_prob = 0.0
 
@@ -501,6 +536,27 @@ class AdaptDecoder(nn.Module):
         heading = trajectory_raw[..., 2:3].tanh() * np.pi
         trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)
 
+        # ----------------------------------------------------------------------
+        # 7. Target-speed head — concat hidden states → two-hot speed bin logits
+        # ----------------------------------------------------------------------
+        target_speed_dist = self._target_speed_decoder(concat_hidden)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            target_speed_softmax = torch.softmax(target_speed_dist.float(), dim=-1)
+            target_speed_scalar = decode_two_hot(
+                target_speed_softmax,
+                self.config.target_speed_classes,
+                self.device,
+            )
+
+        # ----------------------------------------------------------------------
+        # 8. Route head — concat hidden states → per-step (Δx, Δy) deltas
+        # then cumulative sum to produce absolute checkpoints, matching TFv6's
+        # PlanningDecoder formulation.
+        # ----------------------------------------------------------------------
+        route_flat = self._route_decoder(concat_hidden)
+        route_deltas = route_flat.reshape(bs, self._num_route_checkpoints, 2)
+        route = torch.cumsum(route_deltas, dim=1)
+
         # If we are not training (no GT future), populate ``future_token_ids``
         # with the AR samples so the dataclass contract is honoured. These are
         # not used for any loss in that mode.
@@ -513,6 +569,9 @@ class AdaptDecoder(nn.Module):
         return AdaptDecoderOutput(
             pred_future_waypoints=trajectory_fp32[..., :2],
             pred_headings=trajectory_fp32[..., 2],
+            pred_route=route.float(),
+            pred_target_speed_distribution=target_speed_dist.float(),
+            pred_target_speed_scalar=target_speed_scalar.float(),
             trajectory=trajectory_fp32,
             output_logits=output_logits,
             future_token_ids=future_token_ids,
@@ -622,6 +681,51 @@ class AdaptDecoder(nn.Module):
             dictionary_loss = decoder_outputs.get("dictionary_loss")
             if dictionary_loss is not None:
                 loss["loss_dictionary"] = dictionary_loss.float()
+
+            # Target-speed loss — two-hot cross-entropy against the expert's
+            # commanded speed (encoded as a two-hot distribution over
+            # ``target_speed_classes``). Mirrors TFv6's PlanningDecoder.
+            pred_target_speed_dist = decoder_outputs[
+                "pred_target_speed_distribution"
+            ].float()
+            if "target_speed" in data and "brake" in data:
+                brake_label = data["brake"].to(
+                    self.device, dtype=torch.bool, non_blocking=True,
+                )
+                target_speed_distribution = encode_two_hot(
+                    data["target_speed"].to(
+                        self.device,
+                        dtype=self.config.torch_float_type,
+                        non_blocking=True,
+                    ),
+                    self.config.target_speed_classes,
+                    brake=brake_label,
+                )
+                loss["loss_target_speed"] = F.cross_entropy(
+                    pred_target_speed_dist,
+                    target_speed_distribution,
+                )
+            else:
+                # Keep the head in the autograd graph even when GT is absent.
+                loss["loss_target_speed"] = pred_target_speed_dist.sum() * 0.0
+
+            # Route loss — L1 ADE + final-step FDE on the predicted route
+            # checkpoints, again following TFv6's PlanningDecoder formulation.
+            pred_route = decoder_outputs["pred_route"].float()
+            if "route" in data:
+                route_label = data["route"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                ).float()
+                loss["loss_spatial_route"] = F.l1_loss(
+                    pred_route, route_label,
+                )
+                loss["loss_spatial_route"] = loss["loss_spatial_route"] + F.l1_loss(
+                    pred_route[:, -1, :], route_label[:, -1, :],
+                )
+            else:
+                loss["loss_spatial_route"] = pred_route.sum() * 0.0
 
         if (
             "iteration" in data

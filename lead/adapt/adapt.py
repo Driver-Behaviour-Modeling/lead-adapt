@@ -140,6 +140,11 @@ class TFv6(nn.Module):
             )
             pred_future_waypoints = adapt_outputs["pred_future_waypoints"]
             pred_headings = adapt_outputs["pred_headings"]
+            pred_route = adapt_outputs["pred_route"]
+            pred_target_speed_distribution = (
+                adapt_outputs["pred_target_speed_distribution"]
+            )
+            pred_target_speed_scalar = adapt_outputs["pred_target_speed_scalar"]
             self._adapt_outputs = adapt_outputs
 
         # Semantic segmentation forward pass
