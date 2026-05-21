@@ -101,8 +101,11 @@ class OpenLoopInference:
         )
         if has_any_planner:
             if (
-                self.config_training.use_planning_decoder
-                and self.config_training.predict_target_speed
+                (
+                    self.config_training.use_planning_decoder
+                    and self.config_training.predict_target_speed
+                )
+                or getattr(self.config_training, "use_adapt_decoder", False)
             ):
                 pred_target_speed_logits = torch.stack(
                     [pred.pred_target_speed_distribution[0] for pred in predictions],
@@ -136,8 +139,11 @@ class OpenLoopInference:
                 ).mean(dim=0, keepdim=True)  # Average waypoints.
 
             if (
-                self.config_training.use_planning_decoder
-                and self.config_training.predict_spatial_path
+                (
+                    self.config_training.use_planning_decoder
+                    and self.config_training.predict_spatial_path
+                )
+                or getattr(self.config_training, "use_adapt_decoder", False)
             ):
                 pred_routes = torch.stack(
                     [pred.pred_route[0] for pred in predictions],
