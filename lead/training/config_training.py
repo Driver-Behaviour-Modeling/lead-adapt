@@ -173,6 +173,10 @@ class TrainingConfig(BaseConfig):
     load_file: str = None
     # If true continue the training from a failed training checkpoint.
     continue_failed_training = False
+    # If false, allow missing/unexpected keys when loading load_file (e.g. when
+    # loading a checkpoint that predates new heads).  Defaults to True so normal
+    # exact-match loading is preserved.
+    strict_weight_load: bool = True
 
     @property
     def epoch_checkpoints_keep(self):

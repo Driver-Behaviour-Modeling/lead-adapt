@@ -146,7 +146,7 @@ def initialize_model(
             LOG.info(f"Continuing training from epoch {start_epoch}")
         model.load_state_dict(
             torch.load(config.load_file, map_location=config.device, weights_only=True),
-            strict=config.continue_failed_training,
+            strict=config.continue_failed_training and config.strict_weight_load,
         )
 
     model.backbone.requires_grad_(not config.freeze_backbone)

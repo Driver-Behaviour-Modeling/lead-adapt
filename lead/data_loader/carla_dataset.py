@@ -444,6 +444,7 @@ class CARLAData(Dataset):
         # Route and target speed features
         if (
             self.config.use_planning_decoder
+            or self.config.use_adapt_decoder
             or self.config.visualize_dataset
             or self.build_buckets
         ):

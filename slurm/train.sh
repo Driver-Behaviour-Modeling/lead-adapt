@@ -40,8 +40,8 @@ export NCCL_P2P_LEVEL=NVL # https://github.com/huggingface/accelerate/issues/314
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())")
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=$((10000 + RANDOM % 50000))
+export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+export MASTER_PORT=${MASTER_PORT:-$((10000 + RANDOM % 50000))}
 echo "Using $nproc_per_node GPUs per node. MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "LEAD_TRAINING_CONFIG: $LEAD_TRAINING_CONFIG"
 if [ "$nproc_per_node" -le 1 ]; then
