@@ -423,11 +423,7 @@ class CARLAData(Dataset):
                 dtype=np.float32,
             ).reshape(-1, 2)
             past_yaws = np.array(
-                [
-                    past_yaws_raw[i]
-                    for i in hist_indices
-                    if i < len(past_yaws_raw)
-                ],
+                [past_yaws_raw[i] for i in hist_indices if i < len(past_yaws_raw)],
                 dtype=np.float32,
             ).reshape(-1)
 
