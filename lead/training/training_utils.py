@@ -144,10 +144,47 @@ def initialize_model(
         if config.continue_failed_training:
             start_epoch = int("".join(filter(str.isdigit, load_name))) + 1
             LOG.info(f"Continuing training from epoch {start_epoch}")
-        model.load_state_dict(
-            torch.load(config.load_file, map_location=config.device, weights_only=True),
-            strict=config.continue_failed_training and config.strict_weight_load,
+        strict_load = config.continue_failed_training and config.strict_weight_load
+        checkpoint_sd = torch.load(
+            config.load_file,
+            map_location=config.device,
+            weights_only=True,
         )
+        if not strict_load:
+            # Drop checkpoint entries whose shape no longer matches the current
+            # model, so they initialise fresh instead of raising (or silently
+            # copying a stale shape). Happens when a config knob changes the
+            # size of a buffer/param between the loaded checkpoint and this run
+            # — e.g. toggling radar changes ``status_pos_embedding``'s token
+            # count. ``strict=False`` only tolerates name mismatches, not shape.
+            model_sd = model.state_dict()
+            shape_mismatched = [
+                k
+                for k, v in checkpoint_sd.items()
+                if k in model_sd and v.shape != model_sd[k].shape
+            ]
+            for k in shape_mismatched:
+                del checkpoint_sd[k]
+            if shape_mismatched:
+                LOG.warning(
+                    "load_state_dict dropped shape-mismatched keys "
+                    "(initialised fresh): %s",
+                    shape_mismatched,
+                )
+        load_result = model.load_state_dict(checkpoint_sd, strict=strict_load)
+        # With strict=False (e.g. post-training with new/changed heads), report
+        # which params initialised fresh vs. failed to match, so a genuine
+        # weight-name mismatch isn't hidden alongside the intentionally-new ones.
+        if load_result.missing_keys:
+            LOG.info(
+                "load_state_dict missing keys (initialised fresh): %s",
+                load_result.missing_keys,
+            )
+        if load_result.unexpected_keys:
+            LOG.warning(
+                "load_state_dict unexpected keys (in checkpoint, unused): %s",
+                load_result.unexpected_keys,
+            )
 
     model.backbone.requires_grad_(not config.freeze_backbone)
     LOG.info(

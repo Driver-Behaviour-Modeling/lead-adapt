@@ -460,6 +460,26 @@ class TrainingConfig(BaseConfig):
             return 0.8
         return 0.5
 
+    # Scheduled sampling for the ADAPT AR decoder — anneal from pure teacher
+    # forcing towards autoregressive rollout over training, so the planning
+    # heads see model-generated (not just GT) token hidden states and closed-
+    # loop drift is reduced. Ported from the NavSim ADAPT agent. Only active
+    # when ``use_adapt_decoder`` is set. Disabled by default (start >= epochs
+    # leaves ``_ss_prob`` at 0) — enable per-run via LEAD_TRAINING_CONFIG.
+    use_scheduled_sampling = False
+    # Pure teacher forcing for the first N epochs before ramping begins.
+    scheduled_sampling_start_epoch = 3
+    # Max probability of substituting the model's own predicted token for GT.
+    scheduled_sampling_max_prob = 1.0
+    # Epochs to linearly ramp _ss_prob from 0 -> max_prob after the start epoch.
+    scheduled_sampling_warmup_epochs = 30
+    # Lower bound on _ss_prob, applied after the ramp is computed. ``_ss_prob``
+    # is a plain attribute (not a buffer), so it is absent from the checkpoint
+    # and the ramp restarts from 0 whenever a run resumes with
+    # ``continue_failed_training=false``. Set this to the level a previous run
+    # had reached to carry it over instead of re-annealing from scratch.
+    scheduled_sampling_min_prob = 0.0
+
     # --- Regularization ---
     @property
     def use_color_aug(self):
@@ -1067,39 +1087,53 @@ class TrainingConfig(BaseConfig):
 
         return weights
 
+    def _read_log_frequency_file(self, filename: str, default: int) -> int:
+        """Read a live-tunable log-frequency file, falling back to ``default``.
+
+        The file is re-read on every access so the frequency can be tuned mid-
+        run. Its absence is a normal fallback (many setups never create these),
+        so a missing/unreadable file is logged at debug level and only once per
+        (path) — not as a per-step error — while genuine parse errors still warn.
+        """
+        path = os.path.join(self.lead_project_root or "", "slurm/configs", filename)
+        try:
+            with open(path) as f:
+                return int(f.readline().strip())
+        except FileNotFoundError:
+            warned = getattr(self, "_log_freq_missing_warned", None)
+            if warned is None:
+                warned = self._log_freq_missing_warned = set()
+            if path not in warned:
+                warned.add(path)
+                LOG.debug(
+                    "Log-frequency file %s not found; using default %d.",
+                    path,
+                    default,
+                )
+            return default
+        except Exception as e:
+            LOG.warning("Error reading log frequency file %s: %s.", path, e)
+            return default
+
     @property
     def log_scalars_frequency(self):
         """How often to log scalar values during training."""
         if self.debug_mode:
             return 1
-        try:
-            with open(
-                os.path.join(
-                    self.lead_project_root,
-                    "slurm/configs/wandb_log_frequency_training_scalar.txt",
-                ),
-            ) as f:
-                return int(f.readline().strip())
-        except Exception as e:
-            LOG.error(f"Error reading log frequency file: {e}.")
-            return 1
+        return self._read_log_frequency_file(
+            "wandb_log_frequency_training_scalar.txt",
+            1,
+        )
 
     @property
     def log_images_frequency(self):
         """How often to log images during training."""
         if self.debug_mode:
             return 100
-        try:
-            with open(
-                os.path.join(
-                    self.lead_project_root,
-                    "slurm/configs/wandb_log_frequency_training_images.txt",
-                ),
-            ) as f:
-                return int(f.readline().strip())
-        except Exception as e:
-            LOG.error(f"Error reading log frequency file: {e}.")
-            return 100
+        return self._read_log_frequency_file(
+            "wandb_log_frequency_training_images.txt",
+            100,
+        )
 
     @overridable_property
     def log_wandb(self):

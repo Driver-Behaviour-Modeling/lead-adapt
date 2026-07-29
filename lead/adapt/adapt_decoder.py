@@ -10,8 +10,8 @@ from beartype import beartype
 from torch import nn
 
 import lead.common.common_utils as common_utils
-from lead.common.constants import RadarLabels
 from lead.adapt import transfuser_utils as fn
+from lead.common.constants import RadarLabels
 from lead.kdisks import KDisksModel
 from lead.training.config_training import TrainingConfig
 
@@ -30,7 +30,8 @@ def generate_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
         that must not be attended to.
     """
     return torch.triu(
-        torch.ones(seq_len, seq_len, device=device), diagonal=1,
+        torch.ones(seq_len, seq_len, device=device),
+        diagonal=1,
     ).bool()
 
 
@@ -186,10 +187,13 @@ def _soft_frechet_loss(
         return gamma * torch.logsumexp(torch.stack([a, b], dim=-1) / gamma, dim=-1)
 
     def soft_min_three(
-        a: torch.Tensor, b: torch.Tensor, c: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
     ) -> torch.Tensor:
         return -gamma * torch.logsumexp(
-            torch.stack([-a, -b, -c], dim=-1) / gamma, dim=-1,
+            torch.stack([-a, -b, -c], dim=-1) / gamma,
+            dim=-1,
         )
 
     ca[:, 0, 0] = dist_mat[:, 0, 0]
@@ -200,7 +204,9 @@ def _soft_frechet_loss(
     for i in range(1, T):
         for j in range(1, T):
             prev_min = soft_min_three(
-                ca[:, i - 1, j], ca[:, i - 1, j - 1], ca[:, i, j - 1],
+                ca[:, i - 1, j],
+                ca[:, i - 1, j - 1],
+                ca[:, i, j - 1],
             )
             ca[:, i, j] = soft_max(prev_min, dist_mat[:, i, j])
 
@@ -275,7 +281,8 @@ class AdaptDecoder(nn.Module):
 
         # Output projection: decoder hidden state → logits over codebook.
         self.output_projection = nn.Linear(
-            config.kinematic_embed_dim, config.kinematic_vocab_size,
+            config.kinematic_embed_dim,
+            config.kinematic_vocab_size,
         )
 
         # Trajectory refinement head: concat decoder hidden states → (x, y, h)
@@ -289,37 +296,48 @@ class AdaptDecoder(nn.Module):
             nn.Linear(config.decoder_ffn_dim, self._num_future_poses * 3),
         )
 
-        # Target-speed head — mirrors TFv6's PlanningDecoder.target_speed_decoder
-        # (two-layer MLP → two-hot bin logits) but reads the concatenated AR
-        # hidden states instead of a dedicated slot query. Restores the
-        # ``throttle_modality="target_speed"`` / ``brake_modality="target_speed"``
-        # control contract that LEAD's closed-loop PID expects.
-        self._target_speed_decoder = nn.Sequential(
-            nn.Linear(
-                config.kinematic_embed_dim * self._num_future_poses,
-                config.decoder_ffn_dim,
-            ),
-            nn.ReLU(inplace=True),
-            nn.Linear(
-                config.decoder_ffn_dim,
-                len(config.target_speed_classes),
-            ),
-        )
-
-        # Route head — mirrors TFv6's PlanningDecoder.route_decoder (per-step
-        # delta + cumsum) so ``steer_modality="route"`` can also work for ADAPT.
-        # Reads the same concatenated hidden states as the trajectory head,
-        # projects to ``num_route_points_prediction × 2`` deltas, and integrates
-        # in time.
+        # Route and target-speed planning head — mirrors TFv6's PlanningDecoder.
+        # Rather than reading the flattened AR trajectory hidden states (which
+        # are shaped by the trajectory objective and leave route/speed
+        # under-conditioned at junctions), we give route and speed their own
+        # learnable query tokens that cross-attend to ``encoder_context``. That
+        # context already carries the navigation target-point / command status
+        # tokens, so the queries are navigation-grounded for free. This restores
+        # the ``steer_modality="route"`` and ``target_speed`` control contracts
+        # that LEAD's closed-loop PID expects, matching the known-good TFv6 head.
         self._num_route_checkpoints = config.num_route_points_prediction
-        self._route_decoder = nn.Sequential(
-            nn.Linear(
-                config.kinematic_embed_dim * self._num_future_poses,
-                config.decoder_ffn_dim,
+        # Query layout: [route_0 ... route_{N-1}, target_speed].
+        self._num_plan_queries = self._num_route_checkpoints + 1
+        self._plan_query = nn.Parameter(
+            torch.zeros(
+                1,
+                self._num_plan_queries,
+                config.kinematic_embed_dim,
             ),
-            nn.ReLU(inplace=True),
-            nn.Linear(config.decoder_ffn_dim, self._num_route_checkpoints * 2),
         )
+        self._plan_decoder = nn.TransformerDecoder(
+            decoder_layer=nn.TransformerDecoderLayer(
+                d_model=config.kinematic_embed_dim,
+                nhead=config.decoder_num_heads,
+                dim_feedforward=config.decoder_ffn_dim,
+                dropout=config.decoder_dropout,
+                activation=nn.GELU(),
+                batch_first=True,
+            ),
+            num_layers=config.decoder_num_layers,
+            norm=nn.LayerNorm(config.kinematic_embed_dim),
+        )
+        # Per-step (Δx, Δy) decoded from each route query, then cumsum in time
+        # (matches TFv6's PlanningDecoder.route_decoder formulation).
+        self._route_decoder = nn.Linear(config.kinematic_embed_dim, 2)
+        # Two-hot bin logits from the dedicated target-speed query.
+        self._target_speed_decoder = nn.Sequential(
+            nn.Linear(config.kinematic_embed_dim, config.kinematic_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(config.kinematic_embed_dim, len(config.target_speed_classes)),
+        )
+        # TFv6 initialises its planning queries with uniform noise.
+        nn.init.uniform_(self._plan_query)
 
         # Scheduled-sampling probability — bumped by the training loop if used.
         self._ss_prob = 0.0
@@ -373,20 +391,32 @@ class AdaptDecoder(nn.Module):
         # registered as float32 buffers and autocast can otherwise downcast
         # ``history_deltas`` to bf16/fp16, leaving ``argmin`` on a mixed-dtype
         # distance matrix.
-        past_positions = data["past_positions"].to(
-            device=device, non_blocking=True,
-        )[:, : self._num_history_poses, :2].float()
-        past_yaws = data["past_yaws"].to(
-            device=device, non_blocking=True,
-        )[:, : self._num_history_poses].float()
+        past_positions = (
+            data["past_positions"]
+            .to(
+                device=device,
+                non_blocking=True,
+            )[:, : self._num_history_poses, :2]
+            .float()
+        )
+        past_yaws = (
+            data["past_yaws"]
+            .to(
+                device=device,
+                non_blocking=True,
+            )[:, : self._num_history_poses]
+            .float()
+        )
         history_poses = torch.cat(
-            [past_positions, past_yaws.unsqueeze(-1)], dim=-1,
+            [past_positions, past_yaws.unsqueeze(-1)],
+            dim=-1,
         )  # [B, T_hist, 3]
         T_hist = history_poses.shape[1]
 
         history_deltas = self.kdisks_model._compute_deltas(history_poses)
         kinematic_tokens = self.kdisks_model.encode(history_deltas).view(
-            bs, T_hist - 1,
+            bs,
+            T_hist - 1,
         )
 
         # ----------------------------------------------------------------------
@@ -400,24 +430,37 @@ class AdaptDecoder(nn.Module):
 
         if self.training and "future_waypoints" in data:
             T_future_cfg = self._num_future_poses
-            future_waypoints = data["future_waypoints"].to(
-                device=device, non_blocking=True,
-            )[:, :T_future_cfg, :2].float()
-            future_yaws = data["future_yaws"].to(
-                device=device, non_blocking=True,
-            )[:, :T_future_cfg].float()
+            future_waypoints = (
+                data["future_waypoints"]
+                .to(
+                    device=device,
+                    non_blocking=True,
+                )[:, :T_future_cfg, :2]
+                .float()
+            )
+            future_yaws = (
+                data["future_yaws"]
+                .to(
+                    device=device,
+                    non_blocking=True,
+                )[:, :T_future_cfg]
+                .float()
+            )
             target_trajectory = torch.cat(
-                [future_waypoints, future_yaws.unsqueeze(-1)], dim=-1,
+                [future_waypoints, future_yaws.unsqueeze(-1)],
+                dim=-1,
             )  # [B, T_future, 3]
             T_future = target_trajectory.shape[1]
 
             last_history_pose = history_poses[:, -1:, :]
             full_future_seq = torch.cat(
-                [last_history_pose, target_trajectory], dim=1,
+                [last_history_pose, target_trajectory],
+                dim=1,
             )  # [B, T_future+1, 3]
             future_deltas = self.kdisks_model._compute_deltas(full_future_seq)
             future_token_ids = self.kdisks_model.encode(future_deltas).view(
-                bs, T_future,
+                bs,
+                T_future,
             )
 
             if self.config.use_kdisks:
@@ -475,7 +518,8 @@ class AdaptDecoder(nn.Module):
                         next_token = last_logits.argmax(dim=-1)
 
                     generated_tokens = torch.cat(
-                        [generated_tokens, next_token], dim=1,
+                        [generated_tokens, next_token],
+                        dim=1,
                     )
 
                 output_logits = torch.cat(all_logits_list, dim=1)
@@ -483,7 +527,8 @@ class AdaptDecoder(nn.Module):
             else:
                 # ---- Pure teacher forcing (parallel) -------------------------
                 decoder_input_tokens = torch.cat(
-                    [kinematic_tokens, future_token_ids[:, :-1]], dim=1,
+                    [kinematic_tokens, future_token_ids[:, :-1]],
+                    dim=1,
                 )
                 seq_len = decoder_input_tokens.shape[1]
                 causal_mask = generate_causal_mask(seq_len, device)
@@ -496,9 +541,7 @@ class AdaptDecoder(nn.Module):
                 all_logits = self.output_projection(decoder_output)
                 num_history_tokens = kinematic_tokens.shape[1]
                 output_logits = all_logits[:, num_history_tokens - 1 :, :]
-                future_hidden_states = decoder_output[
-                    :, num_history_tokens - 1 :, :
-                ]
+                future_hidden_states = decoder_output[:, num_history_tokens - 1 :, :]
         else:
             # ---- AR inference (validation / test) ---------------------------
             T_future = self._num_future_poses
@@ -521,7 +564,8 @@ class AdaptDecoder(nn.Module):
 
                 next_token = last_logits.argmax(dim=-1)
                 generated_tokens = torch.cat(
-                    [generated_tokens, next_token], dim=1,
+                    [generated_tokens, next_token],
+                    dim=1,
                 )
 
             output_logits = torch.cat(all_logits_list, dim=1)
@@ -537,9 +581,21 @@ class AdaptDecoder(nn.Module):
         trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)
 
         # ----------------------------------------------------------------------
-        # 7. Target-speed head — concat hidden states → two-hot speed bin logits
+        # 7. Planning head — dedicated route/speed queries cross-attend to the
+        # encoder context (BEV + status tokens incl. navigation target-point /
+        # command + history poses). Unlike the trajectory head, route and speed
+        # are decoded from their own query embeddings rather than the flattened
+        # AR trajectory hidden states, mirroring TFv6's PlanningDecoder.
         # ----------------------------------------------------------------------
-        target_speed_dist = self._target_speed_decoder(concat_hidden)
+        plan_queries = self._plan_decoder(
+            self._plan_query.expand(bs, -1, -1),
+            encoder_context,
+        )  # [B, num_route_checkpoints + 1, D]
+        route_queries = plan_queries[:, : self._num_route_checkpoints, :]
+        speed_query = plan_queries[:, self._num_route_checkpoints, :]
+
+        # Target-speed head → two-hot speed bin logits.
+        target_speed_dist = self._target_speed_decoder(speed_query)
         with torch.amp.autocast(device_type="cuda", enabled=False):
             target_speed_softmax = torch.softmax(target_speed_dist.float(), dim=-1)
             target_speed_scalar = decode_two_hot(
@@ -549,12 +605,11 @@ class AdaptDecoder(nn.Module):
             )
 
         # ----------------------------------------------------------------------
-        # 8. Route head — concat hidden states → per-step (Δx, Δy) deltas
-        # then cumulative sum to produce absolute checkpoints, matching TFv6's
+        # 8. Route head — per-step (Δx, Δy) deltas from each route query, then
+        # cumulative sum to produce absolute checkpoints, matching TFv6's
         # PlanningDecoder formulation.
         # ----------------------------------------------------------------------
-        route_flat = self._route_decoder(concat_hidden)
-        route_deltas = route_flat.reshape(bs, self._num_route_checkpoints, 2)
+        route_deltas = self._route_decoder(route_queries)
         route = torch.cumsum(route_deltas, dim=1)
 
         # If we are not training (no GT future), populate ``future_token_ids``
@@ -607,9 +662,7 @@ class AdaptDecoder(nn.Module):
         # trajectory (end-of-route, post-collision, etc.). Skip trajectory
         # terms for that batch; the token-CE and codebook losses below still
         # contribute gradients to the decoder.
-        has_trajectory_gt = (
-            "future_waypoints" in data and "future_yaws" in data
-        )
+        has_trajectory_gt = "future_waypoints" in data and "future_yaws" in data
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
             num_steps = self.config.num_way_points_prediction
@@ -617,22 +670,33 @@ class AdaptDecoder(nn.Module):
             pred_traj = decoder_outputs["trajectory"][:, :num_steps].float()
 
             if has_trajectory_gt:
-                waypoints_label = data["future_waypoints"].to(
-                    self.device,
-                    dtype=self.config.torch_float_type,
-                    non_blocking=True,
-                )[:, :num_steps].float()
-                heading_label = data["future_yaws"].to(
-                    self.device,
-                    dtype=self.config.torch_float_type,
-                    non_blocking=True,
-                )[:, :num_steps].float()
+                waypoints_label = (
+                    data["future_waypoints"]
+                    .to(
+                        self.device,
+                        dtype=self.config.torch_float_type,
+                        non_blocking=True,
+                    )[:, :num_steps]
+                    .float()
+                )
+                heading_label = (
+                    data["future_yaws"]
+                    .to(
+                        self.device,
+                        dtype=self.config.torch_float_type,
+                        non_blocking=True,
+                    )[:, :num_steps]
+                    .float()
+                )
                 gt_traj = torch.cat(
-                    [waypoints_label, heading_label.unsqueeze(-1)], dim=-1,
+                    [waypoints_label, heading_label.unsqueeze(-1)],
+                    dim=-1,
                 )  # [B, T, 3]
 
                 loss["loss_trajectory"] = _rotated_l1_loss(
-                    pred_traj, gt_traj, lat_weight=5.0,
+                    pred_traj,
+                    gt_traj,
+                    lat_weight=5.0,
                 )
                 loss["loss_soft_frechet"] = _soft_frechet_loss(
                     pred_traj[..., :2],
@@ -661,7 +725,9 @@ class AdaptDecoder(nn.Module):
                 and decoder_outputs.get("future_deltas") is not None
             )
             if use_soft_ce:
-                future_deltas_flat = decoder_outputs["future_deltas"].reshape(-1, 3).float()
+                future_deltas_flat = (
+                    decoder_outputs["future_deltas"].reshape(-1, 3).float()
+                )
                 loss["loss_kinematic_token"] = soft_cross_entropy_loss(
                     predicted_logits=logits_flat,
                     gt_deltas=future_deltas_flat,
@@ -672,7 +738,9 @@ class AdaptDecoder(nn.Module):
                 )
             else:
                 loss["loss_kinematic_token"] = F.cross_entropy(
-                    logits_flat, target_flat, reduction="mean",
+                    logits_flat,
+                    target_flat,
+                    reduction="mean",
                 )
 
             commitment_loss = decoder_outputs.get("commitment_loss")
@@ -690,7 +758,9 @@ class AdaptDecoder(nn.Module):
             ].float()
             if "target_speed" in data and "brake" in data:
                 brake_label = data["brake"].to(
-                    self.device, dtype=torch.bool, non_blocking=True,
+                    self.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
                 )
                 target_speed_distribution = encode_two_hot(
                     data["target_speed"].to(
@@ -713,16 +783,22 @@ class AdaptDecoder(nn.Module):
             # checkpoints, again following TFv6's PlanningDecoder formulation.
             pred_route = decoder_outputs["pred_route"].float()
             if "route" in data:
-                route_label = data["route"].to(
-                    self.device,
-                    dtype=self.config.torch_float_type,
-                    non_blocking=True,
-                ).float()
+                route_label = (
+                    data["route"]
+                    .to(
+                        self.device,
+                        dtype=self.config.torch_float_type,
+                        non_blocking=True,
+                    )
+                    .float()
+                )
                 loss["loss_spatial_route"] = F.l1_loss(
-                    pred_route, route_label,
+                    pred_route,
+                    route_label,
                 )
                 loss["loss_spatial_route"] = loss["loss_spatial_route"] + F.l1_loss(
-                    pred_route[:, -1, :], route_label[:, -1, :],
+                    pred_route[:, -1, :],
+                    route_label[:, -1, :],
                 )
             else:
                 loss["loss_spatial_route"] = pred_route.sum() * 0.0
@@ -735,19 +811,23 @@ class AdaptDecoder(nn.Module):
                 pred_waypoints = decoder_outputs["pred_future_waypoints"]
                 pred_headings = decoder_outputs["pred_headings"]
                 log["metric/waypoints_ade"] = common_utils.average_displacement_error(
-                    pred_waypoints, waypoints_label,
+                    pred_waypoints,
+                    waypoints_label,
                 )
                 log["metric/waypoints_fde"] = common_utils.final_displacement_error(
-                    pred_waypoints, waypoints_label,
+                    pred_waypoints,
+                    waypoints_label,
                 )
                 log["metric/heading_ade"] = common_utils.average_displacement_error(
-                    pred_headings, heading_label,
+                    pred_headings,
+                    heading_label,
                 )
 
             with torch.no_grad():
                 pred_token_ids = output_logits.argmax(dim=-1)
                 token_accuracy = (pred_token_ids == future_token_ids).float().mean()
             log["metric/token_accuracy"] = token_accuracy.item()
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (Vaswani et al., 2017).
@@ -790,33 +870,65 @@ class FeedForward(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob, use_separable_conv=False):
+    def __init__(
+        self,
+        d_model,
+        ffn_hidden,
+        num_heads,
+        drop_prob,
+        use_separable_conv=False,
+    ):
         super().__init__()
-        self.masked_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.masked_attention = nn.MultiheadAttention(
+            d_model,
+            num_heads,
+            batch_first=True,
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(p=drop_prob)
 
-        self.encoder_decoder_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.encoder_decoder_attention = nn.MultiheadAttention(
+            d_model,
+            num_heads,
+            batch_first=True,
+        )
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(p=drop_prob)
-        
+
         # self.separable_conv = SeparableConvolution(d_model=d_model, hidden=ffn_hidden, drop_prob=drop_prob)
         self.ffn = FeedForward(d_model, ffn_hidden, drop_prob)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout3 = nn.Dropout(p=drop_prob)
 
-    def forward(self, x, encoder_output, self_attention_mask=None, cross_attention_mask=None):
+    def forward(
+        self,
+        x,
+        encoder_output,
+        self_attention_mask=None,
+        cross_attention_mask=None,
+    ):
         residual = x
         x = self.norm1(x)
-        x, _ = self.masked_attention(x, x, x, attn_mask=self_attention_mask, need_weights=False)
+        x, _ = self.masked_attention(
+            x,
+            x,
+            x,
+            attn_mask=self_attention_mask,
+            need_weights=False,
+        )
         x = residual + self.dropout1(x)
-        
+
         residual = x
         x = self.norm2(x)
-        x, _ = self.encoder_decoder_attention(x, encoder_output, encoder_output, 
-                               attn_mask=cross_attention_mask, need_weights=False)
+        x, _ = self.encoder_decoder_attention(
+            x,
+            encoder_output,
+            encoder_output,
+            attn_mask=cross_attention_mask,
+            need_weights=False,
+        )
         x = residual + self.dropout2(x)
-        
+
         # residual = x.clone()
         # x = self.separable_conv(x)
         # x = self.dropout3(x)
@@ -825,32 +937,48 @@ class DecoderLayer(nn.Module):
         x = self.norm3(x)
         x = residual + self.dropout3(self.ffn(x))
         return x
-    
+
 
 class Decoder(nn.Module):
-    def __init__(self,
-                 kinematic_vocab_size,
-                 d_model,
-                 ffn_hidden,
-                 num_heads,
-                 drop_prob,
-                 num_layers,
-                 max_sequence_length,
-                 use_separable_conv=False):
+    def __init__(
+        self,
+        kinematic_vocab_size,
+        d_model,
+        ffn_hidden,
+        num_heads,
+        drop_prob,
+        num_layers,
+        max_sequence_length,
+        use_separable_conv=False,
+    ):
         super().__init__()
         self.d_model = d_model
         self.embedding = nn.Embedding(kinematic_vocab_size, d_model)
         self.pos_encoding = PositionalEncoding(d_model, max_len=max_sequence_length)
         self.dropout = nn.Dropout(p=drop_prob)
-        
-        self.layers = nn.ModuleList([
-            DecoderLayer(d_model, ffn_hidden, num_heads, drop_prob, use_separable_conv) 
-            for _ in range(num_layers)
-        ])
-        
+
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    d_model,
+                    ffn_hidden,
+                    num_heads,
+                    drop_prob,
+                    use_separable_conv,
+                )
+                for _ in range(num_layers)
+            ],
+        )
+
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, tgt_token_ids, encoder_output, self_attention_mask=None, cross_attention_mask=None):
+    def forward(
+        self,
+        tgt_token_ids,
+        encoder_output,
+        self_attention_mask=None,
+        cross_attention_mask=None,
+    ):
         """
         Args:
             tgt_token_ids: [batch, tgt_seq_len]
@@ -862,13 +990,14 @@ class Decoder(nn.Module):
         x = self.embedding(tgt_token_ids) * math.sqrt(self.d_model)  # Scale embeddings
         x = self.pos_encoding(x)
         x = self.dropout(x)
-        
+
         # Apply decoder layers
         for layer in self.layers:
             x = layer(x, encoder_output, self_attention_mask, cross_attention_mask)
-        
+
         x = self.final_norm(x)
         return x
+
 
 @beartype
 def decode_two_hot(
@@ -1029,6 +1158,27 @@ class PlanningContextEncoder(nn.Module):
             self.config.transfuser_token_dim // 2,
             normalize=True,
         )
+        radar_on = (
+            self.config.use_radars
+            and self.config.radar_detection
+            and self.config.use_radar_detection
+        )
+        logger.info(
+            "PlanningContextEncoder built: num_status_tokens=%d "
+            "(vel=%s accel=%s cmd=%s tp=%s prev_tp=%s next_tp=%s "
+            "past_pos=%s past_spd=%s radar=%s radar_queries=%d)",
+            self.num_status_tokens,
+            self.config.use_velocity,
+            self.config.use_acceleration,
+            self.config.use_discrete_command,
+            self.config.use_tp,
+            self.config.use_previous_tp,
+            self.config.use_next_tp,
+            self.config.use_past_positions,
+            self.config.use_past_speeds,
+            radar_on,
+            self.config.num_radar_queries,
+        )
         self.status_pos_embedding = nn.Parameter(
             torch.zeros(1, self.num_status_tokens, self.config.transfuser_token_dim),
         )
@@ -1162,11 +1312,15 @@ class PlanningContextEncoder(nn.Module):
             )  # (bs, 1, transfuser_token_dim)
             status_tokens.append(next_tp_token)
 
-        # Encode radar
+        # Encode radar. ``radar_logits`` may be ``None`` (e.g. the ADAPT decoder
+        # never wires radar through and always passes ``None``); guard on it so
+        # the radar config flags alone can't drive an encode of ``None``.
         if (
             self.config.use_radars
             and self.config.radar_detection
             and self.config.use_radar_detection
+            and radar_logits is not None
+            and radar_predictions is not None
         ):
             radar_token = self.radar_encoder(radar_logits).reshape(
                 -1,

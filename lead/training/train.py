@@ -138,6 +138,37 @@ class Trainer:
                 total_loss_weight  # Normalize to sum to 1
             )
 
+    def schedule_scheduled_sampling(self, epoch: int):
+        """Anneal the ADAPT AR decoder's scheduled-sampling probability.
+
+        Pure teacher forcing for ``scheduled_sampling_start_epoch`` epochs, then
+        a linear ramp from 0 to ``scheduled_sampling_max_prob`` over
+        ``scheduled_sampling_warmup_epochs``. Mirrors the NavSim ADAPT agent's
+        ``on_train_epoch_start`` anneal. No-op unless scheduled sampling is
+        enabled and the model exposes an ``adapt_decoder`` with ``_ss_prob``.
+        """
+        if not getattr(self.config, "use_scheduled_sampling", False):
+            return
+        decoder = getattr(self.model, "adapt_decoder", None)
+        if decoder is None or not hasattr(decoder, "_ss_prob"):
+            return
+
+        start = self.config.scheduled_sampling_start_epoch
+        max_prob = self.config.scheduled_sampling_max_prob
+        warmup = self.config.scheduled_sampling_warmup_epochs
+        min_prob = getattr(self.config, "scheduled_sampling_min_prob", 0.0)
+        if epoch < start:
+            prob = 0.0
+        else:
+            prob = min(max_prob, max_prob * (epoch - start) / max(warmup, 1))
+        # Floor the ramp so a resumed run keeps a previous run's annealed level
+        # instead of restarting from pure teacher forcing (``_ss_prob`` is not
+        # checkpointed). Also applies during the pre-``start`` epochs.
+        prob = max(prob, min(min_prob, max_prob))
+        decoder._ss_prob = prob
+        if self.config.rank == 0:
+            LOG.info("Epoch %d: scheduled_sampling_prob = %.3f", epoch, prob)
+
     def train_loop(self):
         for epoch in range(self.cur_epoch, self.config.epochs):
             self.dataloader.dataset.shuffle(epoch)
@@ -147,6 +178,9 @@ class Trainer:
 
             # Update loss weights
             self.schedule_loss_weights(epoch)
+
+            # Anneal scheduled sampling (teacher forcing -> autoregressive)
+            self.schedule_scheduled_sampling(epoch)
 
             # Training
             rfm_score = self.train()

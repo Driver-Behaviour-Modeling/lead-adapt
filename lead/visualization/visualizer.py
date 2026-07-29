@@ -13,6 +13,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 import lead.common.common_utils as common_utils
 import lead.common.constants as constants
+from lead.adapt.adapt import Prediction as AdaptPrediction
+from lead.adapt.center_net_decoder import PredictedBoundingBox
 from lead.common.constants import (
     CARLA_NAVIGATION_COMMAND_STR_MAP,
     RadarLabels,
@@ -22,10 +24,11 @@ from lead.data_loader import carla_dataset_utils
 from lead.inference.closed_loop_inference import ClosedLoopPrediction
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopPrediction
-from lead.adapt.center_net_decoder import PredictedBoundingBox
-from lead.adapt.adapt import Prediction
+from lead.tfv6.tfv6 import Prediction as Tfv6Prediction
 from lead.training.config_training import TrainingConfig
 from lead.visualization import viz_utils
+
+Prediction = Tfv6Prediction | AdaptPrediction
 
 
 class Visualizer:
