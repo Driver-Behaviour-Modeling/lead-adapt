@@ -974,17 +974,21 @@ class Decoder(nn.Module):
 
     def forward(
         self,
-        tgt_token_ids,
-        encoder_output,
-        self_attention_mask=None,
-        cross_attention_mask=None,
-    ):
-        """
+        tgt_token_ids: torch.Tensor,
+        encoder_output: torch.Tensor,
+        self_attention_mask: torch.Tensor | None = None,
+        cross_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the decoder stack over the target tokens.
+
         Args:
-            tgt_token_ids: [batch, tgt_seq_len]
-            encoder_output: [batch, src_seq_len, d_model]
-            self_attention_mask: Optional causal mask for decoder self-attention
-            cross_attention_mask: Optional mask for encoder-decoder attention
+            tgt_token_ids: Target token ids of shape [batch, tgt_seq_len].
+            encoder_output: Encoder memory of shape [batch, src_seq_len, d_model].
+            self_attention_mask: Optional causal mask for decoder self-attention.
+            cross_attention_mask: Optional mask for encoder-decoder attention.
+
+        Returns:
+            Decoded hidden states of shape [batch, tgt_seq_len, d_model].
         """
         # Embed and add positional encoding
         x = self.embedding(tgt_token_ids) * math.sqrt(self.d_model)  # Scale embeddings
