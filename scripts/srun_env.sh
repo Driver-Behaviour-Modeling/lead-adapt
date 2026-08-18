@@ -55,8 +55,14 @@ export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
 export TRANSFORMERS_CACHE="${HF_HOME}/hub"
 export FONTCONFIG_PATH="/etc/fonts"
 export XDG_RUNTIME_DIR="${HOME}/.cache/runtime"
+# TrainingConfig.training_session_cache_path reads $SCRATCH and otherwise falls
+# back to /tmp/$USER, which on this box lives on the 968G root filesystem. The
+# diskcache size_limit is 2TB, so it never self-evicts there and fills / to 100%
+# instead. Point it at /localstorage (10T) where the limit actually fits.
+export SCRATCH="${HOME}/scratch"
 mkdir -p "${MPLCONFIGDIR}" "${HUGGINGFACE_HUB_CACHE}" \
-         "${XDG_CACHE_HOME}/fontconfig" "${XDG_RUNTIME_DIR}" 2>/dev/null
+         "${XDG_CACHE_HOME}/fontconfig" "${XDG_RUNTIME_DIR}" \
+         "${SCRATCH}" 2>/dev/null
 
 unset _i LEAD_LS_HOME LEAD_CONDA_ROOT
 

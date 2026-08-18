@@ -219,6 +219,11 @@ class MixedSampler(torch.utils.data.BatchSampler):
         ) * torch.cuda.device_count()
 
 
+# Keys whose collation failure has already been logged, so a broken key warns
+# once instead of on every batch.
+_COLLATE_FAILURES_LOGGED: set[str] = set()
+
+
 def mixed_data_collate_fn(batch):
     """Custom collate function to handle missing keys in mixed dataset batches.
     What happens is that some datasets may not have all keys (e.g., some datasets may not have semantic segmentation labels).
@@ -255,7 +260,23 @@ def mixed_data_collate_fn(batch):
             new_vals.append(v)
         try:
             collated[key] = torch.utils.data._utils.collate.default_collate(new_vals)
-        except:
-            pass
+        except Exception as e:
+            # Dropping the key silently turns a collation problem into a
+            # ``KeyError`` (or, worse, a silently disabled loss term) deep inside
+            # the model. Log the shapes once per key so the real cause is visible.
+            if key not in _COLLATE_FAILURES_LOGGED:
+                _COLLATE_FAILURES_LOGGED.add(key)
+                shapes = [
+                    tuple(np.shape(v)) if hasattr(v, "shape") else type(v).__name__
+                    for v in new_vals
+                ]
+                LOG.warning(
+                    "Dropping key %r from the batch: it failed to collate (%s: %s). "
+                    "Per-sample shapes: %s",
+                    key,
+                    type(e).__name__,
+                    e,
+                    shapes,
+                )
 
     return collated

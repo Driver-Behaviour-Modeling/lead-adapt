@@ -346,6 +346,8 @@ class AdaptDecoder(nn.Module):
     def forward(
         self,
         bev_features: jt.Float[torch.Tensor, "bs bev_dim height_bev width_bev"],
+        radar_features: jt.Float[torch.Tensor, "bs num_radar_queries radar_dim"] | None,
+        radar_predictions: jt.Float[torch.Tensor, "bs num_radar_queries 4"] | None,
         data: dict,
         log: dict,
     ) -> AdaptDecoderOutput:
@@ -358,6 +360,12 @@ class AdaptDecoder(nn.Module):
 
         Args:
             bev_features: Raw BEV feature grid from the backbone.
+            radar_features: Radar detection features, or ``None`` when radar is
+                disabled. Must be non-``None`` whenever the radar status tokens
+                are enabled in the config, otherwise the context encoder's
+                positional embedding is sized for tokens that never arrive.
+            radar_predictions: Radar detection predictions matching
+                ``radar_features``, or ``None``.
             data: Per-batch data dict. Required keys: ``past_positions`` and
                 ``past_yaws`` for history. During training, ``future_waypoints``
                 and ``future_yaws`` are used to build teacher-forcing targets.
@@ -377,8 +385,8 @@ class AdaptDecoder(nn.Module):
         # ----------------------------------------------------------------------
         context_tokens = self.adapt_context_encoder(
             bev_features=bev_features,
-            radar_logits=None,
-            radar_predictions=None,
+            radar_logits=radar_features,
+            radar_predictions=radar_predictions,
             data=data,
             log=log,
         )
@@ -1143,11 +1151,12 @@ class PlanningContextEncoder(nn.Module):
             logger.info("Using past speeds encoder.")
             self.past_speeds_encoder = nn.Linear(1, config.transfuser_token_dim)
 
-        if (
+        self._use_radar_tokens = (
             self.config.use_radars
             and self.config.radar_detection
             and self.config.use_radar_detection
-        ):
+        )
+        if self._use_radar_tokens:
             self.num_status_tokens += self.config.num_radar_queries
             self.radar_encoder = nn.Linear(
                 self.config.radar_token_dim,
@@ -1162,11 +1171,6 @@ class PlanningContextEncoder(nn.Module):
             self.config.transfuser_token_dim // 2,
             normalize=True,
         )
-        radar_on = (
-            self.config.use_radars
-            and self.config.radar_detection
-            and self.config.use_radar_detection
-        )
         logger.info(
             "PlanningContextEncoder built: num_status_tokens=%d "
             "(vel=%s accel=%s cmd=%s tp=%s prev_tp=%s next_tp=%s "
@@ -1180,7 +1184,7 @@ class PlanningContextEncoder(nn.Module):
             self.config.use_next_tp,
             self.config.use_past_positions,
             self.config.use_past_speeds,
-            radar_on,
+            self._use_radar_tokens,
             self.config.num_radar_queries,
         )
         self.status_pos_embedding = nn.Parameter(
@@ -1316,16 +1320,17 @@ class PlanningContextEncoder(nn.Module):
             )  # (bs, 1, transfuser_token_dim)
             status_tokens.append(next_tp_token)
 
-        # Encode radar. ``radar_logits`` may be ``None`` (e.g. the ADAPT decoder
-        # never wires radar through and always passes ``None``); guard on it so
-        # the radar config flags alone can't drive an encode of ``None``.
-        if (
-            self.config.use_radars
-            and self.config.radar_detection
-            and self.config.use_radar_detection
-            and radar_logits is not None
-            and radar_predictions is not None
-        ):
+        # Encode radar. ``self._use_radar_tokens`` mirrors the budget reserved in
+        # ``status_pos_embedding``, so missing radar inputs must fail loudly here
+        # rather than silently producing fewer status tokens than the embedding.
+        if self._use_radar_tokens:
+            if radar_logits is None or radar_predictions is None:
+                raise ValueError(
+                    "Radar status tokens are enabled (use_radars, radar_detection "
+                    "and use_radar_detection are all set) but the caller passed no "
+                    "radar features. Wire the radar detector outputs into the "
+                    "context encoder, or disable the radar config flags.",
+                )
             radar_token = self.radar_encoder(radar_logits).reshape(
                 -1,
                 self.config.num_radar_queries,

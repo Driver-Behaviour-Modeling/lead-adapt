@@ -8,17 +8,16 @@ import torch
 from beartype import beartype
 from torch import nn
 
-from lead.common.constants import SourceDataset
+from lead.adapt.adapt_decoder import AdaptDecoder
 from lead.adapt.bev_decoder import BEVDecoder
 from lead.adapt.center_net_decoder import (
     CenterNetBoundingBoxPrediction,
     CenterNetDecoder,
 )
 from lead.adapt.perspective_decoder import PerspectiveDecoder
-from lead.adapt.planning_decoder import PlanningDecoder
-from lead.adapt.adapt_decoder import AdaptDecoder
 from lead.adapt.radar_detector import RadarDetector
 from lead.adapt.transfuser_backbone import TransfuserBackbone
+from lead.common.constants import SourceDataset
 from lead.training.config_training import TrainingConfig
 
 
@@ -104,8 +103,8 @@ class TFv6(nn.Module):
         #         config=self.config,
         #         device=self.device,
         #     ).to(self.device)
-        
-        #ADAPT Decoder
+
+        # ADAPT Decoder
         if self.config.use_adapt_decoder:
             self.adapt_decoder = AdaptDecoder(
                 input_bev_channels=self.backbone.num_lidar_features,
@@ -133,17 +132,23 @@ class TFv6(nn.Module):
         # Planning heads
         self._adapt_outputs = None
         if self.config.use_adapt_decoder:
+            planner_radar_features = radar_features
+            planner_radar_predictions = radar_predictions
+            if not self.config.use_radar_detection or not self.config.use_carla_data:
+                planner_radar_features = planner_radar_predictions = None
             adapt_outputs = self.adapt_decoder(
                 bev_features=bev_features,
+                radar_features=planner_radar_features,
+                radar_predictions=planner_radar_predictions,
                 data=data,
                 log=self.log,
             )
             pred_future_waypoints = adapt_outputs["pred_future_waypoints"]
             pred_headings = adapt_outputs["pred_headings"]
             pred_route = adapt_outputs["pred_route"]
-            pred_target_speed_distribution = (
-                adapt_outputs["pred_target_speed_distribution"]
-            )
+            pred_target_speed_distribution = adapt_outputs[
+                "pred_target_speed_distribution"
+            ]
             pred_target_speed_scalar = adapt_outputs["pred_target_speed_scalar"]
             self._adapt_outputs = adapt_outputs
 
