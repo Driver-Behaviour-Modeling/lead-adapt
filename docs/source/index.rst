@@ -26,7 +26,10 @@ The basic section is sufficient to get started with the local data collection, t
 
    data_collection
    carla_training
+   training_performance
+   navigation_conditioning
    evaluation
+   turn_diagnostics
    jupyter_notebooks
 
 .. toctree::

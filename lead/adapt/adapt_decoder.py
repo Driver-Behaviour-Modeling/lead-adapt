@@ -11,6 +11,7 @@ from torch import nn
 
 import lead.common.common_utils as common_utils
 from lead.adapt import transfuser_utils as fn
+from lead.adapt.navigation_conditioning import NavigationEncoder, NavigationModulation
 from lead.common.constants import RadarLabels
 from lead.kdisks import KDisksModel
 from lead.training.config_training import TrainingConfig
@@ -301,8 +302,9 @@ class AdaptDecoder(nn.Module):
         # are shaped by the trajectory objective and leave route/speed
         # under-conditioned at junctions), we give route and speed their own
         # learnable query tokens that cross-attend to ``encoder_context``. That
-        # context already carries the navigation target-point / command status
-        # tokens, so the queries are navigation-grounded for free. This restores
+        # context carries navigation target-point / command status tokens. The
+        # optional dedicated navigation encoder below also conditions queries
+        # directly at initialization and before each planning layer. This restores
         # the ``steer_modality="route"`` and ``target_speed`` control contracts
         # that LEAD's closed-loop PID expects, matching the known-good TFv6 head.
         self._num_route_checkpoints = config.num_route_points_prediction
@@ -339,8 +341,68 @@ class AdaptDecoder(nn.Module):
         # TFv6 initialises its planning queries with uniform noise.
         nn.init.uniform_(self._plan_query)
 
+        # Keep the legacy module layout and initialization order intact. Old
+        # configs default to false and load their state dicts strictly unchanged.
+        self.navigation_conditioning = getattr(
+            config,
+            "adapt_navigation_conditioning",
+            False,
+        )
+        if type(self.navigation_conditioning) is not bool:
+            raise ValueError("adapt_navigation_conditioning must be a boolean")
+        if self.navigation_conditioning:
+            if not all(
+                (
+                    config.use_tp,
+                    config.use_previous_tp,
+                    config.use_next_tp,
+                    config.use_discrete_command,
+                ),
+            ):
+                raise ValueError(
+                    "ADAPT navigation conditioning requires previous/current/next "
+                    "target points and discrete commands (CARLA navigation inputs)",
+                )
+            self._navigation_encoder = NavigationEncoder(
+                d_model=config.kinematic_embed_dim,
+                command_dim=config.discrete_command_dim,
+                point_normalization=config.target_points_normalization_constants,
+            )
+            self._navigation_query_init = nn.Linear(
+                config.kinematic_embed_dim,
+                config.kinematic_embed_dim,
+            )
+            nn.init.zeros_(self._navigation_query_init.weight)
+            nn.init.zeros_(self._navigation_query_init.bias)
+            self._navigation_modulations = nn.ModuleList(
+                NavigationModulation(config.kinematic_embed_dim)
+                for _ in self._plan_decoder.layers
+            )
+
         # Scheduled-sampling probability — bumped by the training loop if used.
         self._ss_prob = 0.0
+
+    def _decode_plan_queries(
+        self,
+        encoder_context: torch.Tensor,
+        data: dict,
+    ) -> torch.Tensor:
+        """Condition only the route/speed branch; AR and sensor memory stay separate."""
+        queries = self._plan_query.expand(encoder_context.shape[0], -1, -1)
+        if not self.navigation_conditioning:
+            return self._plan_decoder(queries, encoder_context)
+
+        navigation = self._navigation_encoder(data)
+        queries = queries + self._navigation_query_init(navigation).unsqueeze(1)
+        for layer, modulation in zip(
+            self._plan_decoder.layers,
+            self._navigation_modulations,
+            strict=True,
+        ):
+            queries = layer(modulation(queries, navigation), encoder_context)
+        if self._plan_decoder.norm is not None:
+            queries = self._plan_decoder.norm(queries)
+        return queries
 
     @beartype
     def forward(
@@ -595,9 +657,9 @@ class AdaptDecoder(nn.Module):
         # are decoded from their own query embeddings rather than the flattened
         # AR trajectory hidden states, mirroring TFv6's PlanningDecoder.
         # ----------------------------------------------------------------------
-        plan_queries = self._plan_decoder(
-            self._plan_query.expand(bs, -1, -1),
+        plan_queries = self._decode_plan_queries(
             encoder_context,
+            data,
         )  # [B, num_route_checkpoints + 1, D]
         route_queries = plan_queries[:, : self._num_route_checkpoints, :]
         speed_query = plan_queries[:, self._num_route_checkpoints, :]

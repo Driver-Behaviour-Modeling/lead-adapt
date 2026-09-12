@@ -6,10 +6,8 @@ import time
 
 import cv2
 import diskcache
-import jaxtyping as jt
 import laspy
 import numpy as np
-import numpy.typing as npt
 import torch
 from beartype import beartype
 from numpy.random import default_rng
@@ -23,12 +21,15 @@ from lead.common.constants import (
     TransfuserBEVOccupancyClass,
     TransfuserBEVSemanticClass,
 )
+from lead.common.history_features import sample_training_history
+from lead.common.navigation_features import build_navigation_features
 from lead.data_loader import carla_dataset_utils
 from lead.data_loader.carla_dataset_utils import (
     get_centernet_labels,
     image_augmenter,
     rasterize_lidar,
 )
+from lead.data_loader.metadata_cache import MetadataCache
 from lead.data_loader.training_cache import CacheKey, PersistentCache, SensorData
 from lead.training.config_training import TrainingConfig
 
@@ -64,7 +65,16 @@ class CARLAData(Dataset):
         self.persistent_cache = (
             PersistentCache(self.config) if self.config.use_persistent_cache else None
         )
-        self.memory_cache = {}
+        self.metadata_cache = MetadataCache(
+            session_cache=(
+                None if config.force_rebuild_data_cache else training_session_cache
+            ),
+            max_entries=(
+                0
+                if config.force_rebuild_data_cache
+                else getattr(config, "metadata_cache_max_entries", 128)
+            ),
+        )
         self.semantic_converter = np.uint8(
             list(constants.SEMANTIC_SEGMENTATION_CONVERTER.values()),
         )
@@ -118,14 +128,9 @@ class CARLAData(Dataset):
         # Determine files of index
         global_index = self.global_indices[index]  # Index in dataset
 
-        # Load meta-data file from disk
+        # Reuse decompressed metadata while keeping each sample independently mutable.
         measurement_file = str(self.metas[index], encoding="utf-8")
-        if self.memory_cache is not None and measurement_file in self.memory_cache:
-            meta = self.memory_cache[measurement_file]
-        else:
-            meta = common_utils.read_pickle(measurement_file)
-            if self.training_session_cache is not None:
-                self.training_session_cache[measurement_file] = meta
+        meta = self.metadata_cache.load(measurement_file)
 
         # Choosing normal or sensor-perturbated setup
         if (
@@ -397,43 +402,32 @@ class CARLAData(Dataset):
                     yaw_perturbation=perturbation_rotation,
                 )
 
-        # History poses (for ADAPT autoregressive kinematic tokenization).
-        # The CARLA expert meta files store ``past_positions`` (shape [N, 2])
-        # and ``past_yaws`` (shape [N]) in ego-current frame, ordered
-        # newest → oldest (index 0 is the current frame at the origin).
-        # We sample ``num_history_poses`` frames at ``waypoints_spacing``
-        # (reusing ``past_waypoint_indices`` already built above) and reorder
-        # to oldest → newest so the decoder's delta computation
-        # ``poses[1:] - poses[:-1]`` produces forward-time deltas.
+        # Metadata is newest-first, sampled at every simulator tick. Preserve the
+        # training window that excludes the current pose and ends one waypoint
+        # interval in the past; the shared helper documents the runtime variant.
         if (
             (self.config.use_history_poses or self.config.use_adapt_decoder)
             and not self.build_cache
             and not self.build_buckets
         ):
-            past_positions_raw = meta["past_positions"]
-            past_yaws_raw = meta["past_yaws"]
-            n_hist = self.config.num_history_poses
-            hist_indices = list(reversed(past_waypoint_indices[:n_hist]))
-            past_positions = np.array(
-                [
-                    past_positions_raw[i][:2]
-                    for i in hist_indices
-                    if i < len(past_positions_raw)
-                ],
-                dtype=np.float32,
-            ).reshape(-1, 2)
-            past_yaws = np.array(
-                [past_yaws_raw[i] for i in hist_indices if i < len(past_yaws_raw)],
-                dtype=np.float32,
-            ).reshape(-1)
+            history = sample_training_history(
+                meta["past_positions"],
+                meta["past_yaws"],
+                # Preserve the existing cap imposed by past_waypoint_indices.
+                num_history_poses=len(
+                    past_waypoint_indices[: self.config.num_history_poses],
+                ),
+                waypoints_spacing=self.config.waypoints_spacing,
+                tick_hz=self.config.carla_fps,
+            )
 
             data["past_positions"] = carla_dataset_utils.perturbate_waypoints(
-                past_positions,
+                history.positions,
                 y_perturbation=perturbation_translation,
                 yaw_perturbation=perturbation_rotation,
             )
             data["past_yaws"] = carla_dataset_utils.perturbate_yaws(
-                past_yaws,
+                history.yaws,
                 yaw_perturbation=perturbation_rotation,
             )
 
@@ -480,12 +474,7 @@ class CARLAData(Dataset):
             else:
                 ego_position = np.array(meta["noisy_pos_global"][:2])
 
-        def transform_and_augment(point: list[float]) -> jt.Float[npt.NDArray, " 2"]:
-            ego_point = common_utils.inverse_conversion_2d(
-                np.array(point),
-                ego_position,
-                ego_yaw,
-            )
+        def augment_target(ego_point: np.ndarray) -> np.ndarray:
             return carla_dataset_utils.perturbate_target_point(
                 ego_point,
                 y_perturbation=perturbation_translation,
@@ -501,40 +490,25 @@ class CARLAData(Dataset):
         next_command_list = meta[
             f"next{noisy_version}_commands_{self.config.tp_pop_distance}"
         ]
-        # Merge duplicates target point
-        filtered_tp_list = []
-        filtered_command_list = []
-        for pt, cmd in zip(next_tp_list, next_command_list, strict=False):
-            if (
-                len(next_tp_list) == 2
-                or not filtered_tp_list
-                or not np.allclose(pt[:2], filtered_tp_list[-1][:2])
-            ):
-                filtered_tp_list.append(pt)
-                filtered_command_list.append(cmd)
-        next_tp_list = filtered_tp_list
-        next_command_list = filtered_command_list
-
-        # Convert to ego and augment
-        if len(next_tp_list) > 2:
-            data["target_point_next"] = transform_and_augment(next_tp_list[2][:2])
-            data["target_point"] = transform_and_augment(next_tp_list[1][:2])
-            data["target_point_previous"] = transform_and_augment(next_tp_list[0][:2])
-        else:
-            assert len(next_tp_list) == 2
-            data["target_point"] = transform_and_augment(next_tp_list[1][:2])
-            data["target_point_next"] = transform_and_augment(next_tp_list[1][:2])
-            data["target_point_previous"] = transform_and_augment(next_tp_list[0][:2])
+        navigation = build_navigation_features(
+            next_tp_list,
+            next_command_list,
+            ego_position,
+            ego_yaw,
+            augment=augment_target,
+        )
+        for key in ("target_point_previous", "target_point", "target_point_next"):
+            data[key] = navigation[key]
 
         if self.config.use_discrete_command or self.config.visualize_dataset:
             data["command"] = carla_dataset_utils.command_to_one_hot(
-                next_command_list[0],
+                navigation["command_id"],
             )
             data["next_command"] = carla_dataset_utils.command_to_one_hot(
-                next_command_list[1],
+                navigation["next_command_id"],
             )
             data["previous_command"] = carla_dataset_utils.command_to_one_hot(
-                next_command_list[0],
+                navigation["command_id"],
             )
 
         loading_meta_time = time.time() - start_loading_time
@@ -569,7 +543,7 @@ class CARLAData(Dataset):
         if sensor_data.image is None:
             data["rgb"] = None
         else:
-            if self.config.use_color_aug:
+            if self.config.use_color_aug and not self.config.gpu_color_augmentation:
                 processed_image = self.image_augmenter_func(image=sensor_data.image)
             else:
                 processed_image = sensor_data.image

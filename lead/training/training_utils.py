@@ -28,6 +28,7 @@ from lead.data_loader.carla_dataset import CARLAData
 from lead.data_loader.navsim_dataset import NavsimData
 from lead.data_loader.waymo_e2e_dataset import WODE2EData
 from lead.training import mixed_training_utils
+from lead.training.compilation import configure_compilation
 from lead.training.config_training import TrainingConfig
 
 LOG = logging.getLogger(__name__)
@@ -202,14 +203,7 @@ def initialize_model(
         )
     else:
         model_wrapper = model
-    if config.compile:
-        model = torch.compile(
-            model,
-            fullgraph=True,  # require entire model to be compiled, fail if not
-            dynamic=False,  # aggressively specialize to current input shapes
-            backend="inductor",
-            mode="max-autotune",  # highest autotune + CUDA graph
-        )
+    configure_compilation(model_wrapper, config)
     return model_wrapper, start_epoch
 
 
@@ -412,8 +406,8 @@ def initialize_dataloader(
         generator=g_cuda,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=config.prefetch_factor,
-        persistent_workers=True,
+        prefetch_factor=config.prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
         collate_fn=collate_fn,
     )
     return dataloader_train, mixed_sampler

@@ -36,6 +36,21 @@ class PerspectiveDecoder(nn.Module):
         self.config = config
         self.device = device
         self.source_data = source_data
+        # Defaults also support config objects saved before these options existed.
+        self.upsample_perspective_logits = getattr(
+            config,
+            "upsample_perspective_logits",
+            False,
+        )
+        self.upsample_mode = getattr(config, "upsample_mode", "bilinear")
+        if self.upsample_mode not in ("bilinear", "nearest"):
+            raise ValueError(
+                "Perspective upsample_mode must be 'bilinear' or 'nearest', "
+                f"got {self.upsample_mode!r}",
+            )
+        self.upsample_align_corners = (
+            False if self.upsample_mode == "bilinear" else None
+        )
         self.scale_factor_0 = (
             perspective_upsample_factor // self.config.deconv_scale_factor_0
         )
@@ -202,17 +217,22 @@ class PerspectiveDecoder(nn.Module):
         x = F.interpolate(
             x,
             scale_factor=self.scale_factor_0,
-            mode="bilinear",
-            align_corners=False,
+            mode=self.upsample_mode,
+            align_corners=self.upsample_align_corners,
         )
         x = self.deconv2(x)
+        # Predict at the smaller grid to avoid full-resolution convolutions.
+        # Keep module names and parameter shapes compatible with old checkpoints.
+        if self.upsample_perspective_logits:
+            x = self.deconv3(x)
         x = F.interpolate(
             x,
             scale_factor=self.scale_factor_1,
-            mode="bilinear",
-            align_corners=False,
+            mode=self.upsample_mode,
+            align_corners=self.upsample_align_corners,
         )
-        x = self.deconv3(x)
+        if not self.upsample_perspective_logits:
+            x = self.deconv3(x)
 
         # Ensure output size matches expected size
         expected_h = self.config.final_image_height
@@ -227,8 +247,8 @@ class PerspectiveDecoder(nn.Module):
             x = F.interpolate(
                 x,
                 size=(expected_h, expected_w),
-                mode="bilinear",
-                align_corners=False,
+                mode=self.upsample_mode,
+                align_corners=self.upsample_align_corners,
             )
 
         if self.modality == "depth":

@@ -15,6 +15,7 @@ from lead.common.constants import SourceDataset
 from lead.common.logging_config import setup_logging
 from lead.data_loader.waymo_e2e_dataset import evaluate_waymo_e2e
 from lead.training import training_utils
+from lead.training.input_pipeline import prepared_training_batches
 from lead.training.logger import Logger
 
 matplotlib.use("Agg")  # non-GUI backend for headless servers
@@ -198,73 +199,78 @@ class Trainer:
     def train(self) -> float | None:
         self.model_wrapper.train()
 
-        # Train loop
-        for epoch_iteration, data in enumerate(
-            tqdm(
-                islice(self.dataloader, self.gradient_steps_per_epoch),
-                total=self.gradient_steps_per_epoch,
-                disable=self.config.rank != 0,
-            ),
-        ):
-            loss = torch.zeros(
-                1,
-                dtype=self.config.torch_float_type,
-                device=self.config.device,
-            )
-            data["iteration"] = epoch_iteration
-            data["training_step"] = self.step
-            with torch.amp.autocast(
-                device_type="cuda",
-                dtype=self.config.torch_float_type,
-                enabled=self.config.use_mixed_precision_training,
+        with prepared_training_batches(
+            islice(self.dataloader, self.gradient_steps_per_epoch),
+            self.config,
+        ) as batches:
+            # Train loop
+            for epoch_iteration, data in enumerate(
+                tqdm(
+                    batches,
+                    total=self.gradient_steps_per_epoch,
+                    disable=self.config.rank != 0,
+                ),
             ):
-                # Forward pass
-                predictions = self.model_wrapper(data=data)
-                losses, log = self.model.compute_loss(
-                    predictions=predictions,
+                loss = torch.zeros(
+                    1,
+                    dtype=self.config.torch_float_type,
+                    device=self.config.device,
+                )
+                data["iteration"] = epoch_iteration
+                data["training_step"] = self.step
+                with torch.amp.autocast(
+                    device_type="cuda",
+                    dtype=self.config.torch_float_type,
+                    enabled=self.config.use_mixed_precision_training,
+                ):
+                    # Forward pass
+                    predictions = self.model_wrapper(data=data)
+                    losses, log = self.model.compute_loss(
+                        predictions=predictions,
+                        data=data,
+                    )
+                    self.step += 1
+
+                    # Sum up losses
+                    for key, value in losses.items():
+                        loss += self.detailed_loss_weights[key] * value.reshape(
+                            1,
+                        )  # Reshape as sanity check if the loss is a scalar
+                    scaled_loss = {
+                        key: self.detailed_loss_weights[key] * value
+                        for key, value in losses.items()
+                    }
+                # Important to backprop outside the autocast context
+                self.scaler.scale(loss).backward()
+
+                # Gradient step
+                scale_before = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.gradient_steps_skipped += int(
+                    scale_before > self.scaler.get_scale(),
+                )  # Count how many times the scale changed
+                if not (scale_before > self.scaler.get_scale()):
+                    self.scheduler.step(
+                        self.gradient_steps_per_epoch * self.cur_epoch
+                        + epoch_iteration,
+                    )
+                if self.scaler.get_scale() > self.config.grad_scaler_max_grad_scale:
+                    self.scaler.update(new_scale=self.config.grad_scaler_max_grad_scale)
+
+                self.logger.log_train(
+                    epoch_iteration=epoch_iteration,
+                    cur_epoch=self.cur_epoch,
+                    unscaled_loss=losses,
+                    scaled_loss=scaled_loss,
                     data=data,
+                    step=int(self.cur_epoch * self.gradient_steps_per_epoch)
+                    + epoch_iteration,
+                    gradient_steps_skipped=self.gradient_steps_skipped,
+                    log=log,
+                    predictions=predictions,
                 )
-                self.step += 1
-
-                # Sum up losses
-                for key, value in losses.items():
-                    loss += self.detailed_loss_weights[key] * value.reshape(
-                        1,
-                    )  # Reshape as sanity check if the loss is a scalar
-                scaled_loss = {
-                    key: self.detailed_loss_weights[key] * value
-                    for key, value in losses.items()
-                }
-            # Important to backprop outside the autocast context
-            self.scaler.scale(loss).backward()
-
-            # Gradient step
-            scale_before = self.scaler.get_scale()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.gradient_steps_skipped += int(
-                scale_before > self.scaler.get_scale(),
-            )  # Count how many times the scale changed
-            if not (scale_before > self.scaler.get_scale()):
-                self.scheduler.step(
-                    self.gradient_steps_per_epoch * self.cur_epoch + epoch_iteration,
-                )
-            if self.scaler.get_scale() > self.config.grad_scaler_max_grad_scale:
-                self.scaler.update(new_scale=self.config.grad_scaler_max_grad_scale)
-
-            self.logger.log_train(
-                epoch_iteration=epoch_iteration,
-                cur_epoch=self.cur_epoch,
-                unscaled_loss=losses,
-                scaled_loss=scaled_loss,
-                data=data,
-                step=int(self.cur_epoch * self.gradient_steps_per_epoch)
-                + epoch_iteration,
-                gradient_steps_skipped=self.gradient_steps_skipped,
-                log=log,
-                predictions=predictions,
-            )
-            self.optimizer.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(

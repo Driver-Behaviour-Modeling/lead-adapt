@@ -190,26 +190,17 @@ class TrainingConfig(BaseConfig):
     use_training_session_cache = True
     # If true use persistent cache for training. This cache reduces heavy feature building.
     use_persistent_cache = True
+    # Bounded metadata RAM cache per data-loader worker; 0 keeps only disk caching.
+    metadata_cache_max_entries = 128
     # If true force rebuild the cache for each training run.
     force_rebuild_data_cache = False
 
     @property
     def carla_cache_path(self):
-        """Tuple of cache characteristics used to identify cached data compatibility."""
-        return (
-            str(self.image_width_before_camera_subselection),
-            str(self.final_image_height),
-            str(self.min_x_meter),
-            str(self.max_x_meter),
-            str(self.min_y_meter),
-            str(self.max_y_meter),
-            str(self.detect_boxes),
-            str(self.use_depth),
-            str(self.use_semantic),
-            str(self.use_bev_semantic),
-            str(self.load_bev_3rd_person_images),
-            str(self.training_used_lidar_steps),
-        )
+        """Versioned fingerprint of the stored sensor and label preprocessing."""
+        from lead.data_loader.sensor_cache_schema import sensor_cache_path
+
+        return sensor_cache_path(self)
 
     @property
     def training_session_cache_path(self):
@@ -314,10 +305,26 @@ class TrainingConfig(BaseConfig):
     # Number of data loader workers to prefetch batches.
     prefetch_factor = 16
 
-    @property
+    @overridable_property
     def compile(self):
         """If true compile the model for optimization."""
         return True
+
+    # Start with the tensor-heavy backbone. "model" also compiles the planner
+    # and auxiliary forward passes; graph breaks depend on the selected heads.
+    compile_scope = "backbone"
+    compile_backend = "inductor"
+    compile_mode = "default"
+    compile_fullgraph = False
+    compile_dynamic = False
+
+    # Opt-in batch transfer/augmentation. Legacy CPU augmentation stays default.
+    cuda_prefetch = False
+    gpu_color_augmentation = False
+
+    # Opt-in cheaper perspective heads. Defaults reproduce existing checkpoints.
+    upsample_perspective_logits = False
+    upsample_mode = "bilinear"
 
     @property
     def channel_last(self):
@@ -481,7 +488,7 @@ class TrainingConfig(BaseConfig):
     scheduled_sampling_min_prob = 0.0
 
     # --- Regularization ---
-    @property
+    @overridable_property
     def use_color_aug(self):
         """If true apply image color based augmentations."""
         # If true apply image color based augmentations
@@ -712,6 +719,10 @@ class TrainingConfig(BaseConfig):
     # coexist transiently if a closed-loop deployment still needs the
     # speed/route heads from PlanningDecoder.
     use_adapt_decoder = False
+    # Jointly encode previous/current/next navigation geometry and both commands,
+    # then initialize and modulate route/speed queries at every planning layer.
+    # Opt in for a new training run; false preserves old checkpoint architecture.
+    adapt_navigation_conditioning = False
     # Path to the K-disks vocabulary pickle produced by
     # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
     kdisks_vocab_path = "lead/adapt/codebooks/kdisks_carla.pkl"

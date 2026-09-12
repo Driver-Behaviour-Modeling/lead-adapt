@@ -8,12 +8,12 @@ import numpy.typing as npt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from beartype import beartype
 
+from lead.common.runtime_typing import runtime_beartype
 from lead.training.config_training import TrainingConfig
 
 
-@beartype
+@runtime_beartype
 def normalize_imagenet(
     x: jt.Float[torch.Tensor, "B 3 H W"],
 ) -> jt.Float[torch.Tensor, "B 3 H W"]:
@@ -131,7 +131,7 @@ def force_fp32(apply_to: tuple[str, ...] | None = None):
     return decorator
 
 
-@beartype
+@runtime_beartype
 def gen_sineembed_for_position(
     pos_tensor: jt.Float[torch.Tensor, "B 2"],
     hidden_dim: int = 64,
@@ -166,7 +166,7 @@ def gen_sineembed_for_position(
     return pos
 
 
-@beartype
+@runtime_beartype
 def unit_normalize_bev_points(
     points: jt.Float[npt.NDArray | torch.Tensor, "... 2"],
     config: TrainingConfig,
@@ -194,7 +194,7 @@ def unit_normalize_bev_points(
     return points
 
 
-@beartype
+@runtime_beartype
 def bev_grid_sample(
     bev: jt.Float[torch.Tensor, "B D H W"],
     ref_points: jt.Float[torch.Tensor, "B N 2"],  # absolute coords (x, y)

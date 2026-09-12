@@ -22,6 +22,15 @@ class ClosedLoopConfig(OpenLoopConfig):
     # --- Kalman Filter Settings ---
     use_kalman_filter = False
 
+    # Explicit, independent diagnostic ablations; existing checkpoints retain
+    # their legacy online inputs unless a variant is selected.
+    adapt_history_mode = "legacy"  # legacy | training_aligned
+    navigation_position_source = "legacy"  # legacy | planner
+    navigation_pop_distance_mode = "legacy"  # legacy | training
+    record_driving_diagnostics = False
+    # Selected model-forward steps to preserve for exact offline replay.
+    diagnostic_snapshot_steps = []
+
     # --- Image Processing ---
     # JPEG quality used in inference (0-100)
     jpeg_quality = 90

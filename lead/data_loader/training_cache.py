@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
 import lzma
 import os
 import pickle
-from dataclasses import dataclass
+import tempfile
+from dataclasses import InitVar, dataclass, field
 
 import cv2
 import jaxtyping as jt
@@ -233,7 +235,16 @@ class CacheKey:
     route: str
     frame: str
     perturbated: bool
-    config: TrainingConfig
+    config: InitVar[TrainingConfig]
+    dataset_root: str = field(init=False)
+    compatibility: tuple[str, str] = field(init=False)
+
+    def __post_init__(self, config):
+        # Snapshot only compatibility, never the mutable run configuration.
+        # diskcache pickles non-string keys: serializing the full TrainingConfig
+        # would make unrelated optimizer settings create different sensor entries.
+        object.__setattr__(self, "dataset_root", os.path.realpath(config.carla_root))
+        object.__setattr__(self, "compatibility", config.carla_cache_path)
 
     @property
     def persistent_cache_full_path(self):
@@ -241,17 +252,28 @@ class CacheKey:
         if self.perturbated:
             perturbation_path = "perturbated"
         return os.path.join(
-            self.config.carla_root,
+            self.dataset_root,
             "cache",
             self.scenario,
             self.route,
-            *self.config.carla_cache_path,
+            *self.compatibility,
             perturbation_path,
             f"{self.frame}.pkl",
         )
 
     def __str__(self):
-        return f"{self.scenario}_{self.route}_{self.frame}_{self.perturbated})"
+        return json.dumps(
+            (
+                "lead.sensor",
+                self.dataset_root,
+                self.compatibility,
+                self.scenario,
+                self.route,
+                self.frame,
+                self.perturbated,
+            ),
+            separators=(",", ":"),
+        )
 
 
 class PersistentCache:
@@ -269,15 +291,40 @@ class PersistentCache:
     def __setitem__(self, key: CacheKey, value):
         path = key.persistent_cache_full_path
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with lzma.open(path, "wb") as f:
-            pickle.dump(value, f)
+        # Workers/ranks may populate the same frame concurrently. Publish only a
+        # complete compressed pickle; an interrupted writer leaves old data valid.
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=os.path.dirname(path),
+                prefix=".sensor-",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = temporary.name
+                with lzma.LZMAFile(temporary, "wb") as stream:
+                    pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
         self.existence_cache[key] = True
 
     def __getitem__(self, key: CacheKey):
         if key not in self:
             raise KeyError(f"CacheKey {key} does not exist.")
-        with lzma.open(key.persistent_cache_full_path, "rb") as f:
-            return pickle.load(f)
+        try:
+            with lzma.open(key.persistent_cache_full_path, "rb") as f:
+                return pickle.load(f)
+        except (
+            EOFError,
+            lzma.LZMAError,
+            pickle.UnpicklingError,
+            FileNotFoundError,
+        ) as exc:
+            self.existence_cache.pop(key, None)
+            # CARLAData already rebuilds unreadable entries on EOFError.
+            raise EOFError(f"Unreadable sensor cache entry: {key}") from exc
 
 
 @beartype

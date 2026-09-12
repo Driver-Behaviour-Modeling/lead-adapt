@@ -4,14 +4,12 @@ import os
 import shutil
 import typing
 from collections import deque
-from copy import deepcopy
+from copy import copy, deepcopy
 
 import carla
 import cv2
-import jaxtyping as jt
 import matplotlib
 import numpy as np
-import numpy.typing as npt
 import torch
 from agents.navigation.local_planner import RoadOption
 from beartype import beartype
@@ -21,7 +19,13 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from lead.common import common_utils
 from lead.common.base_agent import BaseAgent
 from lead.common.constants import TransfuserBoundingBoxClass
+from lead.common.history_features import sample_runtime_history
 from lead.common.logging_config import setup_logging
+from lead.common.navigation_features import (
+    build_navigation_features,
+    navigation_pop_settings,
+    navigation_position_source,
+)
 from lead.common.route_planner import RoutePlanner
 from lead.common.sensor_setup import av_sensor_setup
 from lead.data_loader import carla_dataset_utils, training_cache
@@ -32,7 +36,17 @@ from lead.inference.closed_loop_inference import (
     ClosedLoopPrediction,
 )
 from lead.inference.config_closed_loop import ClosedLoopConfig
+from lead.inference.driving_diagnostics import (
+    DrivingDiagnostics,
+    control_values,
+    prediction_values,
+)
 from lead.inference.infraction_recorder import InfractionRecorder
+from lead.inference.model_snapshots import (
+    ModelSnapshots,
+    snapshot_metadata,
+    validate_snapshot_steps,
+)
 from lead.inference.video_recorder import VideoRecorder
 from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import Visualizer
@@ -76,6 +90,84 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
         # Generate new config for the case that it has new variables.
         self.training_config = TrainingConfig(json_config)
+
+        # Validate ablation choices before starting a route. These flags never
+        # select privileged localization for policy input.
+        navigation_position_source(self.config_closed_loop, self.training_config)
+        pop_distance, _ = navigation_pop_settings(
+            self.config_closed_loop,
+            self.training_config,
+        )
+        if pop_distance not in self.gps_waypoint_planners_dict:
+            raise ValueError(
+                f"No route planner configured for pop distance {pop_distance}",
+            )
+        if self.config_closed_loop.adapt_history_mode not in {
+            "legacy",
+            "training_aligned",
+        }:
+            raise ValueError("adapt_history_mode must be legacy or training_aligned")
+        snapshot_steps = validate_snapshot_steps(
+            self.config_closed_loop.diagnostic_snapshot_steps,
+            diagnostics_enabled=self.config_closed_loop.record_driving_diagnostics,
+            save_path=self.config_closed_loop.save_path,
+        )
+        self.model_snapshots = None
+        self.driving_diagnostics = None
+        if self.config_closed_loop.record_driving_diagnostics:
+            if self.config_closed_loop.save_path is None:
+                raise ValueError("SAVE_PATH is required for driving diagnostics")
+            self.driving_diagnostics = DrivingDiagnostics(
+                self.config_closed_loop.save_path,
+                metadata={
+                    "route_id": os.environ.get("BENCHMARK_ROUTE_ID"),
+                    "checkpoint_directory": os.path.abspath(path_to_conf_file),
+                    "model_files": sorted(
+                        name
+                        for name in os.listdir(path_to_conf_file)
+                        if name.startswith("model") and name.endswith(".pth")
+                    ),
+                    "training_navigation": {
+                        key: getattr(self.training_config, key)
+                        for key in (
+                            "tp_pop_distance",
+                            "use_noisy_tp",
+                            "use_kalman_filter_for_gps",
+                            "num_history_poses",
+                            "waypoints_spacing",
+                            "carla_fps",
+                        )
+                    },
+                    "inference_choices": {
+                        key: getattr(self.config_closed_loop, key)
+                        for key in (
+                            "adapt_history_mode",
+                            "navigation_position_source",
+                            "navigation_pop_distance_mode",
+                            "use_kalman_filter",
+                            "route_planner_min_distance",
+                            "sensor_agent_pop_distance_adaptive",
+                            "steer_modality",
+                            "throttle_modality",
+                            "brake_modality",
+                        )
+                    },
+                },
+            )
+
+        if snapshot_steps:
+            self.model_snapshots = ModelSnapshots(
+                self.config_closed_loop.save_path,
+                sorted(snapshot_steps),
+                metadata=snapshot_metadata(
+                    path_to_conf_file,
+                    self.training_config,
+                    self.config_closed_loop,
+                ),
+                device=self.device,
+                autocast_enabled=self.training_config.use_mixed_precision_training,
+                autocast_dtype=self.training_config.torch_float_type,
+            )
 
         # Store training config in base class for Kalman filter decision
         # This is accessed by BaseAgent._use_kalman_filter()
@@ -225,7 +317,14 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         )
 
     @beartype
-    def set_target_points(self, input_data: dict, pop_distance: float):
+    def set_target_points(
+        self,
+        input_data: dict,
+        pop_distance: float,
+        *,
+        closed_loop=None,
+        record_trace: bool = True,
+    ):
         """Defines local planning signals based on the input data.
 
         Args:
@@ -234,51 +333,148 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         """
         planner: RoutePlanner = self.gps_waypoint_planners_dict[pop_distance]
 
-        @beartype
-        def transform(point: list[float]) -> jt.Float[npt.NDArray, " 2"]:
-            # Use filtered or noisy position based on training config
-            ego_position = (
-                self.filtered_state[:2]
-                if self.config_closed_loop.use_kalman_filter
-                else input_data["noisy_state"][:2]
-            )
-            return common_utils.inverse_conversion_2d(
-                np.array(point),
-                np.array(ego_position),
-                self.compass,
-            )
-
         next_target_points = [tp[0].tolist() for tp in planner.route]
         next_commands = [int(planner.route[i][1]) for i in range(len(planner.route))]
-
-        # Merge duplicate consecutive target points
-        filtered_tp_list = []
-        filtered_command_list = []
-        for pt, cmd in zip(next_target_points, next_commands, strict=False):
-            if (
-                len(next_target_points) == 2
-                or not filtered_tp_list
-                or not np.allclose(pt[:2], filtered_tp_list[-1][:2])
-            ):
-                filtered_tp_list.append(pt)
-                filtered_command_list.append(cmd)
-        next_target_points = filtered_tp_list
-        next_commands = filtered_command_list
-
-        if len(next_target_points) > 2:
-            input_data["target_point_next"] = transform(next_target_points[2][:2])
-            input_data["target_point"] = transform(next_target_points[1][:2])
-            input_data["target_point_previous"] = transform(next_target_points[0][:2])
-        else:
-            assert len(next_target_points) == 2
-            input_data["target_point_next"] = transform(next_target_points[1][:2])
-            input_data["target_point"] = transform(next_target_points[1][:2])
-            input_data["target_point_previous"] = transform(next_target_points[0][:2])
-
-        input_data["command"] = carla_dataset_utils.command_to_one_hot(next_commands[0])
-        input_data["next_command"] = carla_dataset_utils.command_to_one_hot(
-            next_commands[1],
+        closed_loop = self.config_closed_loop if closed_loop is None else closed_loop
+        source = navigation_position_source(closed_loop, self.training_config)
+        navigation = build_navigation_features(
+            next_target_points,
+            next_commands,
+            input_data[source][:2],
+            self.compass,
         )
+        for key in ("target_point_previous", "target_point", "target_point_next"):
+            input_data[key] = navigation[key]
+        input_data["command"] = carla_dataset_utils.command_to_one_hot(
+            navigation["command_id"],
+        )
+        input_data["next_command"] = carla_dataset_utils.command_to_one_hot(
+            navigation["next_command_id"],
+        )
+        trace = {
+            "pop_distance_m": pop_distance,
+            "target_position_source": source,
+            "planner_position_source": "filtered_state"
+            if self.training_config.use_kalman_filter_for_gps
+            else "noisy_state",
+            "remaining_target_points_world": next_target_points[:12],
+            "remaining_commands": next_commands[:12],
+            "command_id": navigation["command_id"],
+            "next_command_id": navigation["next_command_id"],
+            "targets_before_distant_skip": {
+                key: input_data[key].copy()
+                for key in (
+                    "target_point_previous",
+                    "target_point",
+                    "target_point_next",
+                )
+            },
+        }
+        if record_trace:
+            self._navigation_trace = trace
+        return trace
+
+    @beartype
+    def update_navigation(
+        self,
+        input_data: dict,
+        *,
+        closed_loop=None,
+        record_trace: bool = True,
+    ) -> dict:
+        """Select current planner cues without advancing any route planner."""
+        closed_loop = self.config_closed_loop if closed_loop is None else closed_loop
+        pop_distance, adaptive_pop_distance = navigation_pop_settings(
+            closed_loop,
+            self.training_config,
+        )
+        trace = self.set_target_points(
+            input_data,
+            pop_distance=pop_distance,
+            closed_loop=closed_loop,
+            record_trace=record_trace,
+        )
+        if adaptive_pop_distance:
+            dense_points = (
+                np.linalg.norm(
+                    input_data["target_point"] - input_data["target_point_next"],
+                )
+                < 10.0
+                and min(
+                    np.linalg.norm(input_data["target_point_previous"]),
+                    np.linalg.norm(input_data["target_point"]),
+                )
+                < 10.0
+            )
+            dense_points = dense_points or (
+                np.linalg.norm(
+                    input_data["target_point_previous"] - input_data["target_point"],
+                )
+                < 10.0
+                and min(
+                    np.linalg.norm(input_data["target_point_previous"]),
+                    np.linalg.norm(input_data["target_point"]),
+                )
+                < 10.0
+            )
+            if dense_points:
+                trace = self.set_target_points(
+                    input_data,
+                    pop_distance=4.0,
+                    closed_loop=closed_loop,
+                    record_trace=record_trace,
+                )
+        skipped = bool(
+            closed_loop.sensor_agent_skip_distant_target_point
+            and np.linalg.norm(input_data["target_point_next"])
+            > closed_loop.sensor_agent_skip_distant_target_point_threshold,
+        )
+        if skipped:
+            input_data["target_point_next"] = input_data["target_point"]
+        trace["distant_next_skipped"] = skipped
+        return trace
+
+    @beartype
+    def snapshot_navigation_alternatives(self, input_data: dict) -> dict:
+        """Recompute isolated cues at this observed state; never affect the rollout.
+
+        All planners have already advanced using the recorded localization
+        history. These alternatives do not simulate a different earlier policy
+        trajectory or a different localization estimator for route progression.
+        """
+        overrides = {
+            "baseline": {},
+            "localized_navigation": {"navigation_position_source": "planner"},
+            "training_pop_distance": {"navigation_pop_distance_mode": "training"},
+        }
+        alternatives = {}
+        for name, settings in overrides.items():
+            closed_loop = copy(self.config_closed_loop)
+            for key, value in settings.items():
+                setattr(closed_loop, key, value)
+            alternative_data = dict(input_data)
+            trace = self.update_navigation(
+                alternative_data,
+                closed_loop=closed_loop,
+                record_trace=False,
+            )
+            alternatives[name] = {
+                "inputs": {
+                    key: torch.tensor(
+                        alternative_data[key],
+                        dtype=torch.float32,
+                    ).reshape(1, -1)
+                    for key in (
+                        "target_point_previous",
+                        "target_point",
+                        "target_point_next",
+                        "command",
+                        "next_command",
+                    )
+                },
+                "navigation": trace,
+            }
+        return alternatives
 
     @beartype
     @torch.inference_mode()
@@ -338,45 +534,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
                 input_data[modality] = np.concatenate(rgb_slices, axis=width_axis)
 
-        # Plan next target point and command.
-        self.set_target_points(
-            input_data,
-            pop_distance=self.config_closed_loop.route_planner_min_distance,
-        )
-        if self.config_closed_loop.sensor_agent_pop_distance_adaptive:
-            dense_points = (
-                np.linalg.norm(
-                    input_data["target_point"] - input_data["target_point_next"],
-                )
-                < 10.0
-                and min(
-                    np.linalg.norm(input_data["target_point_previous"]),
-                    np.linalg.norm(input_data["target_point"]),
-                )
-                < 10.0
-            )
-            dense_points = dense_points or (
-                np.linalg.norm(
-                    input_data["target_point_previous"] - input_data["target_point"],
-                )
-                < 10.0
-                and min(
-                    np.linalg.norm(input_data["target_point_previous"]),
-                    np.linalg.norm(input_data["target_point"]),
-                )
-                < 10.0
-            )
-            if dense_points:
-                self.set_target_points(input_data, pop_distance=4.0)
-
-        # Ignore the next target point if it's too far away
-        if (
-            self.config_closed_loop.sensor_agent_skip_distant_target_point
-            and np.linalg.norm(input_data["target_point_next"])
-            > self.config_closed_loop.sensor_agent_skip_distant_target_point_threshold
-        ):
-            # Skip the next target point if it's too far away
-            input_data["target_point_next"] = input_data["target_point"]
+        self.update_navigation(input_data)
 
         # Lidar input
         lidar = self.accumulate_lidar()
@@ -427,8 +585,17 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     @torch.inference_mode()
-    def run_step(self, input_data: dict, _, __=None) -> carla.VehicleControl:
+    def run_step(self, input_data: dict, timestamp, __=None) -> carla.VehicleControl:
         self.step += 1
+        sensor_frames = None
+        if self.driving_diagnostics is not None:
+            sensor_frames = {
+                name: value[0]
+                for name, value in input_data.items()
+                if isinstance(value, tuple)
+                and len(value) == 2
+                and isinstance(value[0], int | float | np.number)
+            }
 
         if not self.initialized:
             self._init()
@@ -484,35 +651,25 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 dtype=torch.float32,
             )[None]
 
-        # ADAPT decoder needs a fixed-length history of ego poses, sampled at the
-        # same cadence (waypoints_spacing) the dataloader used at training time.
-        # ``ego_past_positions`` and ``ego_past_yaws`` are tick-by-tick queues in
-        # the current-ego frame, oldest → newest. Subsample at ``waypoints_spacing``
-        # and front-pad with the oldest available entry if the queue hasn't filled
-        # yet (early ticks of an episode).
+        # Both timing conventions are explicit: legacy includes the current
+        # pose, while training_aligned ends one waypoint interval in the past.
+        history = None
         if getattr(self.training_config, "use_adapt_decoder", False):
-            n_hist = self.training_config.num_history_poses
-            stride = self.training_config.waypoints_spacing
-            positions = np.array(self.ego_past_positions, dtype=np.float32)  # [N, 2]
-            yaws = np.array(self.ego_past_yaws, dtype=np.float32)  # [N]
-            sampled_pos = positions[::-1][::stride][:n_hist][::-1]  # oldest → newest
-            sampled_yaw = yaws[::-1][::stride][:n_hist][::-1]
-            pad_n = n_hist - sampled_pos.shape[0]
-            if pad_n > 0:
-                if sampled_pos.shape[0] > 0:
-                    pos_pad = np.tile(sampled_pos[0:1, :], (pad_n, 1))
-                    yaw_pad = np.tile(sampled_yaw[0:1], pad_n)
-                else:
-                    pos_pad = np.zeros((pad_n, 2), dtype=np.float32)
-                    yaw_pad = np.zeros((pad_n,), dtype=np.float32)
-                sampled_pos = np.concatenate([pos_pad, sampled_pos], axis=0)
-                sampled_yaw = np.concatenate([yaw_pad, sampled_yaw], axis=0)
-            input_data_tensors["past_positions"] = (
-                torch.from_numpy(sampled_pos).to(self.device, dtype=torch.float32)[None]
+            history = sample_runtime_history(
+                self.ego_past_positions,
+                self.ego_past_yaws,
+                num_history_poses=self.training_config.num_history_poses,
+                waypoints_spacing=self.training_config.waypoints_spacing,
+                mode=self.config_closed_loop.adapt_history_mode,
+                tick_hz=self.training_config.carla_fps,
             )
-            input_data_tensors["past_yaws"] = (
-                torch.from_numpy(sampled_yaw).to(self.device, dtype=torch.float32)[None]
-            )
+            input_data_tensors["past_positions"] = torch.from_numpy(
+                history.positions,
+            ).to(self.device, dtype=torch.float32)[None]
+            input_data_tensors["past_yaws"] = torch.from_numpy(history.yaws).to(
+                self.device,
+                dtype=torch.float32,
+            )[None]
 
         # Save input log if need
         if (
@@ -531,9 +688,37 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 + ".pth",
             )
 
+        snapshot = None
+        snapshots = getattr(self, "model_snapshots", None)
+        if snapshots is not None and snapshots.selected(self.step):
+            snapshot = snapshots.prepare(
+                step=self.step,
+                timestamp_seconds=float(timestamp),
+                inputs=input_data_tensors,
+                navigation_alternatives=self.snapshot_navigation_alternatives(
+                    input_data,
+                ),
+            )
+
         # Forward pass
-        closed_loop_prediction: ClosedLoopPrediction = (
-            self.closed_loop_inference.forward(data=input_data_tensors)
+        if snapshot is None:
+            closed_loop_prediction: ClosedLoopPrediction = (
+                self.closed_loop_inference.forward(data=input_data_tensors)
+            )
+        else:
+            with snapshots.capture_decoder_features(
+                snapshot,
+                self.closed_loop_inference.nets,
+            ):
+                closed_loop_prediction = self.closed_loop_inference.forward(
+                    data=input_data_tensors,
+                )
+        if snapshot is not None:
+            snapshots.finish(snapshot, self.closed_loop_inference.predictions)
+        controller_control = (
+            control_values(closed_loop_prediction)
+            if self.driving_diagnostics is not None
+            else None
         )
         # Update bounding boxes
         if (
@@ -581,6 +766,65 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         # CARLA will not let the car drive in the initial frames. This help the filter not get confused.
         if self.step < self.training_config.inital_frames_delay:
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
+
+        if self.driving_diagnostics is not None:
+            transform = self._vehicle.get_transform()
+            self.driving_diagnostics.write(
+                record_type="step",
+                step=self.step,
+                timestamp_seconds=float(timestamp),
+                sensor_frames=sensor_frames,
+                observed_state={
+                    "noisy_state": input_data["noisy_state"],
+                    "filtered_state": input_data["filtered_state"],
+                    "compass_radians": self.compass,
+                    "speed_mps": input_data["speed"],
+                },
+                navigation=self._navigation_trace,
+                model_inputs={
+                    key: input_data_tensors.get(key)
+                    for key in (
+                        "command",
+                        "next_command",
+                        "target_point_previous",
+                        "target_point",
+                        "target_point_next",
+                        "past_positions",
+                        "past_yaws",
+                        "speed",
+                        "radar",
+                    )
+                },
+                history={
+                    "requested_tick_ages": history.requested_tick_ages,
+                    "actual_tick_ages": history.tick_ages,
+                    "padding_mask": history.padding_mask,
+                    "timestamps_seconds": history.timestamps(float(timestamp)),
+                }
+                if history is not None
+                else None,
+                predictions=prediction_values(closed_loop_prediction),
+                radar_predictions_per_model=[
+                    getattr(prediction, "pred_radar_predictions", None)
+                    for prediction in self.closed_loop_inference.predictions
+                ],
+                controller_control=controller_control,
+                executed_control=control_values(self.control),
+                interventions={
+                    "initial_braking": self.step
+                    < self.training_config.inital_frames_delay,
+                    "stuck_detector": self.force_move_post_processor.stuck_detector,
+                    "force_move": self.force_move_post_processor.force_move,
+                },
+                offline_ground_truth={
+                    "position_world_m": [
+                        transform.location.x,
+                        transform.location.y,
+                        transform.location.z,
+                    ],
+                    "yaw_degrees": transform.rotation.yaw,
+                },
+            )
 
         # Check for infractions at this step
         self.check_infractions()
@@ -696,6 +940,12 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     def destroy(self, results=None):
         LOG.info(results)
+
+        if getattr(self, "model_snapshots", None) is not None:
+            self.model_snapshots.close()
+
+        if getattr(self, "driving_diagnostics", None) is not None:
+            self.driving_diagnostics.close()
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):

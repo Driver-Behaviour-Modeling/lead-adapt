@@ -198,6 +198,8 @@ class Visualizer:
                 continue
 
             arr = radar_i[0]
+            if isinstance(arr, torch.Tensor):
+                arr = arr.detach().cpu().numpy()
 
             mask = (arr[:, :3] != 0).any(axis=1)  # drop zero-padded
             pts = arr[mask]
@@ -1411,7 +1413,14 @@ class Visualizer:
         color,
     ):
         bb = np.array(
-            [ego_x, ego_y, self.config.ego_extent_x, self.config.ego_extent_y, ego_yaw],
+            [
+                float(ego_x),
+                float(ego_y),
+                self.config.ego_extent_x,
+                self.config.ego_extent_y,
+                float(ego_yaw),
+                0.0,  # Waypoint boxes have no speed label; draw_box expects one.
+            ],
         )
         bb = carla_dataset_utils.bb_vehicle_to_image_system(
             bb[None],
@@ -1557,21 +1566,21 @@ def visualize_feature_maps(
             "hot",
         ),
         (
-            predictions.pred_future_waypoints[0].detach().cpu().numpy()
+            predictions.pred_future_waypoints[0].detach().cpu().float().numpy()
             if predictions.pred_future_waypoints is not None
             else None,
             "Waypoints",
             "hot",
         ),
         (
-            predictions.pred_route[0].detach().cpu().numpy()
+            predictions.pred_route[0].detach().cpu().float().numpy()
             if predictions.pred_route is not None
             else None,
             "Route",
             "hot",
         ),
         (
-            data.get("radar")[0].cpu().numpy()
+            data.get("radar")[0].detach().cpu().float().numpy()
             if data.get("radar") is not None
             else None,
             "Radar Input",
@@ -1609,7 +1618,8 @@ def visualize_feature_maps(
             ax.set_ylim(config.min_y_meter, config.max_y_meter)
             ax.invert_yaxis()
         elif title == "Radar Detection Label":
-            radar_labels = img[0]
+            # Prefetched labels live on CUDA; Matplotlib needs host arrays.
+            radar_labels = img[0].detach().cpu().float().numpy()
             x, y, v, valid = (
                 radar_labels[:, RadarLabels.X],
                 radar_labels[:, RadarLabels.Y],

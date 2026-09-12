@@ -4,10 +4,10 @@ import jaxtyping as jt
 import timm
 import torch
 import torch.nn.functional as F
-from beartype import beartype
 from torch import nn
 
 from lead.adapt import transfuser_utils as fn
+from lead.common.runtime_typing import runtime_beartype, runtime_jaxtyped
 from lead.training.config_training import TrainingConfig
 
 
@@ -18,7 +18,7 @@ class TransfuserBackbone(nn.Module):
     using transformer-based attention mechanisms across multiple resolution levels.
     """
 
-    @beartype
+    @runtime_beartype
     def __init__(self, device: torch.device, config: TrainingConfig) -> None:
         """Initialize the TransFuser backbone with dual encoder branches and fusion modules.
 
@@ -141,7 +141,7 @@ class TransfuserBackbone(nn.Module):
             (1, 1),
         )
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def top_down(
         self,
         x: jt.Float[torch.Tensor, "B C H W"],
@@ -210,7 +210,7 @@ class TransfuserBackbone(nn.Module):
             )
         return self._forward(rgb, lidar)
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def _forward(
         self,
         image: jt.Float[torch.Tensor, "B 3 img_h img_w"],
@@ -277,7 +277,7 @@ class TransfuserBackbone(nn.Module):
 
         return lidar_features, image_features
 
-    @beartype
+    @runtime_beartype
     def forward_layer_block(
         self,
         layers: Any,
@@ -301,7 +301,7 @@ class TransfuserBackbone(nn.Module):
                 break
         return features
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def fuse_features(
         self,
         image_features: jt.Float[torch.Tensor, "B C H W"],
@@ -355,7 +355,7 @@ class GPT(nn.Module):
     positional embeddings and multi-head self-attention across both modalities.
     """
 
-    @beartype
+    @runtime_beartype
     def __init__(self, n_embd: int, config: TrainingConfig) -> None:
         """Initialize the GPT fusion transformer.
 
@@ -393,7 +393,7 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.apply(self._init_weights)
 
-    @beartype
+    @runtime_beartype
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights for linear and layer norm modules.
 
@@ -414,7 +414,7 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(self.config.gpt_layer_norm_init_weight)
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def forward(
         self,
         image_tensor: jt.Float[torch.Tensor, "B C img_h img_w"],
@@ -473,7 +473,7 @@ class Block(nn.Module):
     multi-head self-attention, and an MLP with residual connections.
     """
 
-    @beartype
+    @runtime_beartype
     def __init__(
         self,
         n_embd: int,
@@ -502,7 +502,7 @@ class Block(nn.Module):
             nn.Dropout(resid_pdrop),
         )
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def forward(
         self,
         x: jt.Float[torch.Tensor, "B T C"],
@@ -529,7 +529,7 @@ class SelfAttention(nn.Module):
     learnable query, key, and value projections.
     """
 
-    @beartype
+    @runtime_beartype
     def __init__(
         self,
         n_embd: int,
@@ -561,7 +561,7 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(n_embd, n_embd)
         self.n_head = n_head
 
-    @jt.jaxtyped(typechecker=beartype)
+    @runtime_jaxtyped
     def forward(
         self,
         x: jt.Float[torch.Tensor, "B T C"],
