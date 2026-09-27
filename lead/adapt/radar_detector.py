@@ -6,8 +6,8 @@ from beartype import beartype
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
-from lead.common.constants import RadarDataIndex, RadarLabels
 from lead.adapt import transfuser_utils as fn
+from lead.common.constants import RadarDataIndex, RadarLabels
 from lead.training.config_training import TrainingConfig
 
 
@@ -215,7 +215,8 @@ class RadarDetector(nn.Module):
         data: dict,
         loss: dict,
         log: dict,
-    ) -> None:
+        return_matching: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         gt_state = data["radar_detections"][
             ...,
             [RadarLabels.X, RadarLabels.Y, RadarLabels.V],
@@ -314,6 +315,12 @@ class RadarDetector(nn.Module):
                 target=matched_label_gt.long(),
                 task="binary",
             )
+
+        if return_matching:
+            # Future supervision follows exactly the same actor assignment as
+            # current-state supervision, even when future trajectories cross.
+            return pred_indices, gt_indices
+        return None
 
     @beartype
     def _batch_hungarian_matching(

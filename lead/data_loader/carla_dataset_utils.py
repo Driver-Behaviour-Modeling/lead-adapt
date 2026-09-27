@@ -9,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 from beartype import beartype
 
+from lead.adapt import center_net_decoder as g_t
 from lead.common import common_utils, constants, ransac
 from lead.common.constants import (
     CONSTRUCTION_CONE_BB_SIZE,
@@ -20,7 +21,6 @@ from lead.common.constants import (
     TransfuserSemanticSegmentationClass,
 )
 from lead.data_loader.training_cache import SensorData
-from lead.adapt import center_net_decoder as g_t
 from lead.training.config_training import TrainingConfig
 
 LOG = logging.getLogger(__name__)
@@ -1217,139 +1217,88 @@ def preprocess_radar_input(
 
 
 @beartype
+def select_radar_detection_boxes(
+    config: TrainingConfig,
+    sensor_data: SensorData,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return metric boxes and their original row indices in radar-label order.
+
+    Keep filtering and stable lexicographic ordering shared by current detections
+    and actor-future labels. Query slots are set predictions, not actor IDs.
+    """
+    if (
+        not config.use_radars
+        or sensor_data.boxes is None
+        or sensor_data.boxes.shape[0] == 0
+    ):
+        return np.empty((0, 9), dtype=np.float32), np.empty(0, dtype=np.int64)
+
+    boxes = bb_image_to_vehicle_system(
+        sensor_data.boxes,
+        config.pixels_per_meter,
+        config.min_x_meter,
+        config.min_y_meter,
+    )
+    non_zero_mask = (boxes[:, TransfuserBoundingBoxIndex.X] != 0.0) | (
+        boxes[:, TransfuserBoundingBoxIndex.Y] != 0.0
+    )
+    radar_mask = boxes[:, TransfuserBoundingBoxIndex.NUM_RADAR_POINTS] > 0
+    indices = np.flatnonzero(non_zero_mask & radar_mask)
+    boxes = boxes[indices]
+    if not len(indices):
+        return boxes, indices
+
+    priority_classes = [
+        TransfuserBoundingBoxClass.SPECIAL,
+        TransfuserBoundingBoxClass.VEHICLE,
+        TransfuserBoundingBoxClass.WALKER,
+        TransfuserBoundingBoxClass.OBSTACLE,
+        TransfuserBoundingBoxClass.PARKING,
+    ]
+    class_priorities = {cls: i for i, cls in enumerate(priority_classes)}
+    class_priority = np.array(
+        [
+            class_priorities.get(int(c), len(priority_classes))
+            for c in boxes[:, TransfuserBoundingBoxIndex.CLASS]
+        ],
+    )
+    sortable = np.stack(
+        [
+            -boxes[:, TransfuserBoundingBoxIndex.VELOCITY],
+            class_priority,
+            -boxes[:, TransfuserBoundingBoxIndex.NUM_RADAR_POINTS],
+        ],
+        axis=1,
+    )
+    order = np.lexsort(sortable.T[::-1])[: config.num_radar_queries]
+    return boxes[order], indices[order]
+
+
+@beartype
 def parse_radar_detection_labels(
     config: TrainingConfig,
     sensor_data: SensorData,
 ) -> jt.Float32[npt.NDArray, "num_queries features"]:
-    """Parse and filter radar detection labels from sensor data for model training.
-
-    This function extracts radar-based object detections from bounding box data, filtering
-    and prioritizing detections based on radar point coverage, object velocity, and class
-    importance. It converts detections to vehicle coordinates and outputs a fixed-size array
-    suitable for model consumption.
-
-    The selection process prioritizes detections by:
-    1. Higher velocity (more relevant for collision avoidance)
-    2. Class priority (SPECIAL > VEHICLE > WALKER > OBSTACLE > PARKING)
-    3. More radar measurement points (higher confidence)
-
-    Args:
-        config: Training configuration containing radar parameters including:
-            - use_radars: Whether radar processing is enabled
-            - num_radar_queries: Maximum number of radar detections to output
-            - pixels_per_meter, min_x_meter, min_y_meter: Coordinate system parameters
-        sensor_data: Sensor data container with bounding boxes, waypoints, and metadata.
-            Must have non-None boxes attribute if radar processing is enabled.
-
-    Returns:
-        Array of shape (num_radar_queries, num_features) containing radar detection labels.
-        Each row represents one detection with features [x, y, velocity, valid_flag].
-        Unused slots are zero-padded. Features are in vehicle coordinate system.
-    """
-    # Initialize default values (all zeros)
+    """Return [x, y, speed, valid] rows in the shared radar selection order."""
     radar_detections = np.zeros(
         (config.num_radar_queries, len(RadarLabels)),
         dtype=np.float32,
     )
-
-    if (
-        config.use_radars
-        and sensor_data.boxes is not None
-        and sensor_data.boxes.shape[0] > 0
-    ):
-        priority_classes = [
-            TransfuserBoundingBoxClass.SPECIAL,
-            TransfuserBoundingBoxClass.VEHICLE,
-            TransfuserBoundingBoxClass.WALKER,
-            TransfuserBoundingBoxClass.OBSTACLE,
-            TransfuserBoundingBoxClass.PARKING,
-        ]
-
-        # Copy data
-        loaded_boxes_image_system = sensor_data.boxes.copy()
-        loaded_waypoints = sensor_data.boxes_waypoints.copy()
-        loaded_num_waypoints = sensor_data.boxes_num_waypoints.copy()
-        loaded_boxes_vehicle_system = bb_image_to_vehicle_system(
-            loaded_boxes_image_system,
-            config.pixels_per_meter,
-            config.min_x_meter,
-            config.min_y_meter,
-        )
-
-        # Remove zero-padded data
-        non_zero_mask = (
-            loaded_boxes_vehicle_system[:, TransfuserBoundingBoxIndex.X] != 0.0
-        ) | (loaded_boxes_vehicle_system[:, TransfuserBoundingBoxIndex.Y] != 0.0)
-        loaded_boxes_vehicle_system = loaded_boxes_vehicle_system[non_zero_mask]
-        loaded_waypoints = loaded_waypoints[non_zero_mask]
-        loaded_num_waypoints = loaded_num_waypoints[non_zero_mask]
-
-        # Filter data with minimally one radar point
-        radar_mask = (
-            loaded_boxes_vehicle_system[:, TransfuserBoundingBoxIndex.NUM_RADAR_POINTS]
-            > 0
-        )
-        loaded_boxes_vehicle_system = loaded_boxes_vehicle_system[radar_mask]
-        loaded_waypoints = loaded_waypoints[radar_mask]
-        loaded_num_waypoints = loaded_num_waypoints[radar_mask]
-
-        selected_boxes = []
-
-        if loaded_boxes_vehicle_system.shape[0] > 0:
-            # Compute class priority index for each box
-            class_priorities = {cls: i for i, cls in enumerate(priority_classes)}
-            class_priority = np.array(
-                [
-                    class_priorities.get(int(c), len(priority_classes))
-                    for c in loaded_boxes_vehicle_system[
-                        :,
-                        TransfuserBoundingBoxIndex.CLASS,
-                    ]
-                ],
-            )
-
-            # Stack into sortable array: (-velocity, class_priority, -num_radar_points)
-            sortable = np.stack(
-                [
-                    -loaded_boxes_vehicle_system[
-                        :,
-                        TransfuserBoundingBoxIndex.VELOCITY,
-                    ],
-                    class_priority,
-                    -loaded_boxes_vehicle_system[
-                        :,
-                        TransfuserBoundingBoxIndex.NUM_RADAR_POINTS,
-                    ],
-                ],
-                axis=1,
-            )
-
-            # Sort lexicographically: we prioritize higher velocity, then class priority, then more radar points
-            sorted_indices = np.lexsort(sortable.T[::-1])
-
-            # Apply sorting to all three arrays
-            sorted_boxes = loaded_boxes_vehicle_system[sorted_indices]
-
-            # Take up to num_radar_queries
-            selected_boxes = sorted_boxes[: config.num_radar_queries]
-
-        if len(selected_boxes) > 0:
-            # Extract [x, y, velocity]
-            n_boxes = selected_boxes.shape[0]
-            radar_detections[:n_boxes, RadarLabels.X] = selected_boxes[
-                :,
-                TransfuserBoundingBoxIndex.X,
-            ]
-            radar_detections[:n_boxes, RadarLabels.Y] = selected_boxes[
-                :,
-                TransfuserBoundingBoxIndex.Y,
-            ]
-            radar_detections[:n_boxes, RadarLabels.V] = selected_boxes[
-                :,
-                TransfuserBoundingBoxIndex.VELOCITY,
-            ]
-            radar_detections[:n_boxes, RadarLabels.VALID] = 1.0  # Valid box indicator
-
+    selected_boxes, _ = select_radar_detection_boxes(config, sensor_data)
+    n_boxes = len(selected_boxes)
+    radar_detections[:n_boxes, RadarLabels.X] = selected_boxes[
+        :,
+        TransfuserBoundingBoxIndex.X,
+    ]
+    radar_detections[:n_boxes, RadarLabels.Y] = selected_boxes[
+        :,
+        TransfuserBoundingBoxIndex.Y,
+    ]
+    radar_detections[:n_boxes, RadarLabels.V] = selected_boxes[
+        :,
+        TransfuserBoundingBoxIndex.VELOCITY,
+    ]
+    radar_detections[:n_boxes, RadarLabels.VALID] = 1.0
     return radar_detections
 
 

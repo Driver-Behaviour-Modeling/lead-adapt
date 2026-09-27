@@ -723,6 +723,18 @@ class TrainingConfig(BaseConfig):
     # then initialize and modulate route/speed queries at every planning layer.
     # Opt in for a new training run; false preserves old checkpoint architecture.
     adapt_navigation_conditioning = False
+    # Predict radar-observed vehicle futures and condition ego planning on them.
+    # Targets are supervision only; inference consumes predicted future states.
+    adapt_world_model = False
+    world_num_steps = 8
+    world_num_modes = 3
+    world_step_seconds = 0.25
+    world_hidden_dim = 256
+    world_position_scale = 10.0
+    world_max_speed = 40.0  # Other actors need not share the ego speed limit.
+    world_position_loss_weight = 1.0
+    world_mode_loss_weight = 0.1
+    world_vehicle_loss_weight = 0.1
     # Path to the K-disks vocabulary pickle produced by
     # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
     kdisks_vocab_path = "lead/adapt/codebooks/kdisks_carla.pkl"
@@ -1095,6 +1107,13 @@ class TrainingConfig(BaseConfig):
             weights["loss_kinematic_token"] = 0.0
             weights["loss_commitment"] = 0.0
             weights["loss_dictionary"] = 0.0
+
+        if self.adapt_world_model:
+            weights.update(
+                world_loss_position=self.world_position_loss_weight,
+                world_loss_mode=self.world_mode_loss_weight,
+                world_loss_vehicle=self.world_vehicle_loss_weight,
+            )
 
         return weights
 

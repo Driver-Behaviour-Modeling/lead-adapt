@@ -31,6 +31,10 @@ from lead.data_loader.carla_dataset_utils import (
 )
 from lead.data_loader.metadata_cache import MetadataCache
 from lead.data_loader.training_cache import CacheKey, PersistentCache, SensorData
+from lead.data_loader.world_model_targets import (
+    build_world_model_targets,
+    validate_world_target_config,
+)
 from lead.training.config_training import TrainingConfig
 
 LOG = logging.getLogger(__name__)
@@ -59,6 +63,8 @@ class CARLAData(Dataset):
             build_buckets: True will return the data earlier without loading sensor data to accelerate the bucket building.
         """
         self.config = config
+        if getattr(config, "adapt_world_model", False):
+            validate_world_target_config(config)
         self.rank = config.rank
 
         self.training_session_cache = training_session_cache
@@ -558,6 +564,9 @@ class CARLAData(Dataset):
                 data[f"radar{i + 1}"] = arr
             data["radar"] = np.concatenate(radar_list, axis=0)
             data["radar_detections"] = sensor_data.radar_detections
+
+        if getattr(self.config, "adapt_world_model", False):
+            data.update(build_world_model_targets(self.config, sensor_data))
 
         # Semantic segmentation
         if self.config.use_semantic and sensor_data.semantic is not None:

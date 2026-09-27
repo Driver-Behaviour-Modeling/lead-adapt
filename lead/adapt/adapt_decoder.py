@@ -12,6 +12,7 @@ from torch import nn
 import lead.common.common_utils as common_utils
 from lead.adapt import transfuser_utils as fn
 from lead.adapt.navigation_conditioning import NavigationEncoder, NavigationModulation
+from lead.adapt.world_attention import FutureContextFusion
 from lead.common.constants import RadarLabels
 from lead.kdisks import KDisksModel
 from lead.training.config_training import TrainingConfig
@@ -380,6 +381,12 @@ class AdaptDecoder(nn.Module):
             )
 
         # Scheduled-sampling probability — bumped by the training loop if used.
+        self.world_model_enabled = getattr(config, "adapt_world_model", False)
+        if self.world_model_enabled:
+            self._world_fusion = FutureContextFusion(
+                config.kinematic_embed_dim,
+                config.decoder_num_heads,
+            )
         self._ss_prob = 0.0
 
     def _decode_plan_queries(
@@ -412,6 +419,8 @@ class AdaptDecoder(nn.Module):
         radar_predictions: jt.Float[torch.Tensor, "bs num_radar_queries 4"] | None,
         data: dict,
         log: dict,
+        world_memory: torch.Tensor | None = None,
+        world_confidence: torch.Tensor | None = None,
     ) -> AdaptDecoderOutput:
         """Run the autoregressive ADAPT decoder over BEV-derived context.
 
@@ -432,6 +441,10 @@ class AdaptDecoder(nn.Module):
                 ``past_yaws`` for history. During training, ``future_waypoints``
                 and ``future_yaws`` are used to build teacher-forcing targets.
             log: Mutable log dict for metrics.
+            world_memory: Predicted actor-future tokens, or ``None`` when the
+                world model is disabled.
+            world_confidence: Per-token confidence values for future attention,
+                or ``None`` when the world model is disabled.
 
         Returns:
             Dict with ``pred_future_waypoints``, ``pred_headings``,
@@ -546,6 +559,14 @@ class AdaptDecoder(nn.Module):
         encoder_context = encoder_context + self.encoder_context_pos_embedding(
             pos_ids,
         )
+        if self.world_model_enabled:
+            if world_memory is None or world_confidence is None:
+                raise ValueError("World-enabled ADAPT requires predicted actor futures")
+            encoder_context = self._world_fusion(
+                encoder_context,
+                world_memory,
+                world_confidence,
+            )
 
         # ----------------------------------------------------------------------
         # 5. Autoregressive decode
