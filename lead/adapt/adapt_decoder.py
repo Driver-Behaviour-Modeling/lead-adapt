@@ -61,6 +61,38 @@ class AdaptDecoderOutput(TypedDict):
     dictionary_loss: jt.Float[torch.Tensor, ""] | None
 
 
+@beartype
+def integrate_body_frame_deltas(
+    deltas: jt.Float[torch.Tensor, "B T 3"],
+    start_pose: jt.Float[torch.Tensor, "B 3"],
+) -> jt.Float[torch.Tensor, "B T 3"]:
+    """Compose per-step body-frame deltas into poses, inverting ``_compute_deltas``.
+
+    p_{k+1} = p_k + R(theta_k) (dx_k, dy_k),  theta_{k+1} = theta_k + dtheta_k.
+
+    Args:
+        deltas: Body-frame (dx, dy, dtheta) per step.
+        start_pose: Pose (x, y, heading) the first delta starts from, in the
+            frame the returned poses are expressed in.
+
+    Returns:
+        Poses after each step, excluding the start pose.
+    """
+    position = start_pose[:, :2]
+    heading = start_pose[:, 2]
+    poses = []
+    for step in range(deltas.shape[1]):
+        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
+        dx, dy = deltas[:, step, 0], deltas[:, step, 1]
+        position = position + torch.stack(
+            [cos_h * dx - sin_h * dy, sin_h * dx + cos_h * dy],
+            dim=-1,
+        )
+        heading = wrap_angle_torch(heading + deltas[:, step, 2])
+        poses.append(torch.cat([position, heading.unsqueeze(-1)], dim=-1))
+    return torch.stack(poses, dim=1)
+
+
 def wrap_angle_torch(angle: torch.Tensor) -> torch.Tensor:
     """Wrap angle to [-π, π] range."""
     return torch.atan2(torch.sin(angle), torch.cos(angle))
@@ -235,6 +267,15 @@ class AdaptDecoder(nn.Module):
         # ``config.kdisks_vocab_path`` and exposes ``_compute_deltas`` /
         # ``encode`` / ``decode`` for kinematic tokenization.
         self.kdisks_model = KDisksModel(self.config)
+        if self.kdisks_model.codebook.num_embeddings != config.kinematic_vocab_size:
+            raise ValueError(
+                f"kinematic_vocab_size={config.kinematic_vocab_size} but the codebook "
+                f"at {config.kdisks_vocab_path} has "
+                f"{self.kdisks_model.codebook.num_embeddings} codes",
+            )
+        self.waypoints_from_tokens = config.adapt_waypoints_from_tokens
+        if self.waypoints_from_tokens and self.kdisks_model.codebook.frame != "body":
+            raise ValueError("adapt_waypoints_from_tokens needs a body-frame codebook")
         self._num_history_poses = self.config.num_history_poses
         self._num_future_poses = self.config.num_way_points_prediction
 
@@ -296,6 +337,8 @@ class AdaptDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(config.decoder_ffn_dim, self._num_future_poses * 3),
         )
+        # Unused when waypoints come from the token rollout; its losses are off.
+        self._trajectory_head.requires_grad_(not self.waypoints_from_tokens)
 
         # Route and target-speed planning head — mirrors TFv6's PlanningDecoder.
         # Rather than reading the flattened AR trajectory hidden states (which
@@ -642,13 +685,21 @@ class AdaptDecoder(nn.Module):
             future_hidden_states = torch.cat(all_hidden_list, dim=1)
 
         # ----------------------------------------------------------------------
-        # 6. Trajectory head — concat hidden states → (x, y, heading)
+        # 6. Trajectory — either the MLP head over concatenated hidden states, or
+        # the argmax token rollout integrated from the current pose.
         # ----------------------------------------------------------------------
-        concat_hidden = future_hidden_states.reshape(bs, -1)
-        trajectory_flat = self._trajectory_head(concat_hidden)
-        trajectory_raw = trajectory_flat.reshape(bs, self._num_future_poses, 3)
-        heading = trajectory_raw[..., 2:3].tanh() * np.pi
-        trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)
+        if self.waypoints_from_tokens:
+            argmax_deltas = self.kdisks_model.decode(output_logits.argmax(dim=-1))
+            trajectory = integrate_body_frame_deltas(
+                argmax_deltas.float(),
+                history_poses[:, -1],
+            )
+        else:
+            concat_hidden = future_hidden_states.reshape(bs, -1)
+            trajectory_flat = self._trajectory_head(concat_hidden)
+            trajectory_raw = trajectory_flat.reshape(bs, self._num_future_poses, 3)
+            heading = trajectory_raw[..., 2:3].tanh() * np.pi
+            trajectory = torch.cat([trajectory_raw[..., :2], heading], dim=-1)
 
         # ----------------------------------------------------------------------
         # 7. Planning head — dedicated route/speed queries cross-attend to the
@@ -730,8 +781,8 @@ class AdaptDecoder(nn.Module):
         """
         # CARLA dataloader omits both keys when a sample has no valid future
         # trajectory (end-of-route, post-collision, etc.). Skip trajectory
-        # terms for that batch; the token-CE and codebook losses below still
-        # contribute gradients to the decoder.
+        # terms for that batch. Token CE is also skipped then: its targets would
+        # be the decoder's own argmax rollout (self-distillation).
         has_trajectory_gt = "future_waypoints" in data and "future_yaws" in data
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
@@ -794,7 +845,9 @@ class AdaptDecoder(nn.Module):
                 and decoder_outputs.get("centroids") is not None
                 and decoder_outputs.get("future_deltas") is not None
             )
-            if use_soft_ce:
+            if decoder_outputs["future_deltas"] is None:
+                loss["loss_kinematic_token"] = logits_flat.sum() * 0.0
+            elif use_soft_ce:
                 future_deltas_flat = (
                     decoder_outputs["future_deltas"].reshape(-1, 3).float()
                 )

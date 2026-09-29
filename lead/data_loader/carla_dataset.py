@@ -402,9 +402,9 @@ class CARLAData(Dataset):
                     yaw_perturbation=perturbation_rotation,
                 )
 
-        # Metadata is newest-first, sampled at every simulator tick. Preserve the
-        # training window that excludes the current pose and ends one waypoint
-        # interval in the past; the shared helper documents the runtime variant.
+        # Metadata is newest-first, sampled at every simulator tick. The training
+        # window ends at the current pose, where the future waypoints start; the
+        # shared helper documents the runtime variants.
         if (
             (self.config.use_history_poses or self.config.use_adapt_decoder)
             and not self.build_cache

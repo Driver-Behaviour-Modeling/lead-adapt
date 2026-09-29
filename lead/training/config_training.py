@@ -178,9 +178,15 @@ class TrainingConfig(BaseConfig):
     # exact-match loading is preserved.
     strict_weight_load: bool = True
 
+    # If true keep every epoch's model checkpoint instead of only the latest.
+    # Needed to pick a checkpoint by held-out loss after training.
+    keep_all_epoch_checkpoints = False
+
     @property
     def epoch_checkpoints_keep(self):
         """Number of checkpoints to keep during training."""
+        if self.keep_all_epoch_checkpoints:
+            return list(range(self.epochs + 1))
         if self.carla_leaderboard_mode and not self.mixed_data_training:
             return []
         return [sum([1 * 2**i for i in range(n)]) for n in range(3, 10)]
@@ -245,6 +251,8 @@ class TrainingConfig(BaseConfig):
     grad_scaler_growth_interval = 256
     # Maximum gradient scale we use for the gradient scaler.
     grad_scaler_max_grad_scale = 2**16
+    # Max global gradient L2 norm; None disables clipping.
+    grad_clip_norm: float = None
 
     @property
     def sync_batchnorm(self) -> bool:
@@ -723,13 +731,24 @@ class TrainingConfig(BaseConfig):
     # then initialize and modulate route/speed queries at every planning layer.
     # Opt in for a new training run; false preserves old checkpoint architecture.
     adapt_navigation_conditioning = False
+    # Train only the AR token decoder (transformer decoder + output projection)
+    # with token cross-entropy; every other module is frozen and kept in eval
+    # mode, so route/speed control is unchanged. Used to fit the token
+    # distribution that the unruliness surprisal is computed from.
+    adapt_train_token_decoder_only = False
+    # Produce pred_future_waypoints/pred_headings by integrating the argmax AR
+    # token rollout instead of the trajectory MLP (whose losses are disabled).
+    adapt_waypoints_from_tokens = False
     # Path to the K-disks vocabulary pickle produced by
     # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
-    kdisks_vocab_path = "lead/adapt/codebooks/kdisks_carla.pkl"
+    # Checkpoints trained before the body-frame fix store the legacy
+    # kdisks_carla.pkl (heading weight 1.0) in their config.json.
+    kdisks_vocab_path = "lead/adapt/codebooks/kdisks_carla_body.pkl"
     # Whether to use K-disks (fixed clustering codebook) vs VQ-VAE.
     use_kdisks = True
-    # Heading weight for the K-disks distance metric.
-    kdisks_heading_weight = 1.0
+    # Heading weight for the K-disks distance metric, in metres per radian. Must
+    # match the codebook; the default is the CARLA ego half-diagonal.
+    kdisks_heading_weight = 2.6719030517676834
     # Whether to normalize delta statistics inside KDisksModel.
     normalize_kinematics = False
     # If true use Gaussian-soft cross-entropy against the K-disks centroids
@@ -739,8 +758,9 @@ class TrainingConfig(BaseConfig):
     soft_ce_sigma = 0.1
     # Floor probability for soft CE numerical stability.
     soft_ce_min_prob = 1e-6
-    # Codebook size — must match the .pkl file produced by the clustering script.
-    kinematic_vocab_size = 4096
+    # Codebook size — must match the .pkl file produced by the clustering script
+    # (kdisks_carla_body.pkl: tolerance 0.05, min_cluster_size 25).
+    kinematic_vocab_size = 1234
     # Decoder embedding dim. Must equal transfuser_token_dim unless a
     # context_proj is added in AdaptDecoder.__init__.
     kinematic_embed_dim = 256
@@ -1095,6 +1115,15 @@ class TrainingConfig(BaseConfig):
             weights["loss_kinematic_token"] = 0.0
             weights["loss_commitment"] = 0.0
             weights["loss_dictionary"] = 0.0
+
+        if self.adapt_waypoints_from_tokens:
+            weights["loss_trajectory"] = 0.0
+            weights["loss_soft_frechet"] = 0.0
+
+        if self.adapt_train_token_decoder_only:
+            weights = {
+                k: (1.0 if k == "loss_kinematic_token" else 0.0) for k in weights
+            }
 
         return weights
 

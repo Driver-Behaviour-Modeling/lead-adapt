@@ -59,7 +59,7 @@ def legacy_runtime(positions, yaws, count=5, stride=5):
 
 
 @pytest.mark.parametrize("turning", [False, True])
-def test_aligned_runtime_matches_metadata_with_actual_base_agent_geometry(turning):
+def test_legacy_runtime_matches_metadata_with_actual_base_agent_geometry(turning):
     positions, yaws = agent_history(turning)
     # These are the exact history serialization operations in Expert.save_meta.
     saved_positions = np.array(positions, dtype=np.float32)[::-1]
@@ -83,20 +83,21 @@ def test_aligned_runtime_matches_metadata_with_actual_base_agent_geometry(turnin
         num_history_poses=5,
         waypoints_spacing=5,
     )
-    np.testing.assert_array_equal(training.positions, aligned.positions)
-    np.testing.assert_array_equal(training.yaws, aligned.yaws)
-    np.testing.assert_array_equal(training.tick_ages, [25, 20, 15, 10, 5])
+    np.testing.assert_array_equal(training.positions, legacy.positions)
+    np.testing.assert_array_equal(training.yaws, legacy.yaws)
+    np.testing.assert_array_equal(training.tick_ages, [20, 15, 10, 5, 0])
     np.testing.assert_array_equal(legacy.tick_ages, [20, 15, 10, 5, 0])
-    np.testing.assert_array_equal(legacy.positions[-1], [0, 0])
-    assert legacy.yaws[-1] == 0
-    assert np.linalg.norm(training.positions[-1]) > 1
+    np.testing.assert_array_equal(aligned.tick_ages, [25, 20, 15, 10, 5])
+    np.testing.assert_array_equal(training.positions[-1], [0, 0])
+    assert training.yaws[-1] == 0
+    assert np.linalg.norm(aligned.positions[-1]) > 1
     if turning:
-        assert abs(training.positions[-1, 1]) > 0.01
-        assert training.yaws[-1] != 0
-        assert np.all(np.abs(aligned.yaws) <= np.pi)
+        assert abs(aligned.positions[-1, 1]) > 0.01
+        assert aligned.yaws[-1] != 0
+        assert np.all(np.abs(training.yaws) <= np.pi)
     else:
-        np.testing.assert_allclose(training.positions[:, 0], [-10, -8, -6, -4, -2])
-        np.testing.assert_array_equal(legacy.positions[:, 0], [-8, -6, -4, -2, 0])
+        np.testing.assert_allclose(aligned.positions[:, 0], [-10, -8, -6, -4, -2])
+        np.testing.assert_array_equal(training.positions[:, 0], [-8, -6, -4, -2, 0])
 
 
 @pytest.mark.parametrize("length", [0, 1, 4, 5, 6, 11, 20, 21, 25, 26, 61])
@@ -128,8 +129,9 @@ def test_training_values_remain_exact_before_and_after_sensor_perturbation(
 ):
     positions = np.arange(length * 3, dtype=np.float64).reshape(-1, 3) / 7
     yaws = np.arange(length, dtype=np.float64) / 11
-    # Original CARLAData selection. Third position coordinates are deliberately ignored.
-    indices = [25, 20, 15, 10, 5]
+    # CARLAData selection ending at the current pose. Third position coordinates
+    # are deliberately ignored.
+    indices = [20, 15, 10, 5, 0]
     expected_positions = np.array(
         [positions[i][:2] for i in indices if i < len(positions)],
         dtype=np.float32,
@@ -186,12 +188,13 @@ def test_recorded_turn_matches_training_without_changing_its_coordinates():
         num_history_poses=5,
         waypoints_spacing=5,
     )
-    np.testing.assert_array_equal(training.positions, positions[[25, 20, 15, 10, 5]])
-    np.testing.assert_array_equal(training.yaws, yaws[[25, 20, 15, 10, 5]])
-    np.testing.assert_array_equal(aligned.positions, training.positions)
-    np.testing.assert_array_equal(aligned.yaws, training.yaws)
-    assert np.linalg.norm(legacy.positions[-1] - training.positions[-1]) > 2.7
-    assert abs(legacy.yaws[-1] - training.yaws[-1]) > 0.14
+    np.testing.assert_array_equal(training.positions, positions[[20, 15, 10, 5, 0]])
+    np.testing.assert_array_equal(training.yaws, yaws[[20, 15, 10, 5, 0]])
+    np.testing.assert_array_equal(legacy.positions, training.positions)
+    np.testing.assert_array_equal(legacy.yaws, training.yaws)
+    np.testing.assert_array_equal(aligned.positions, positions[[25, 20, 15, 10, 5]])
+    assert np.linalg.norm(aligned.positions[-1] - training.positions[-1]) > 2.7
+    assert abs(aligned.yaws[-1] - training.yaws[-1]) > 0.14
 
 
 def test_sample_timestamps_report_actual_padding_ages():
@@ -249,17 +252,16 @@ def test_sampling_contract_generalizes_beyond_checkpoint_defaults(count, stride)
         num_history_poses=count,
         waypoints_spacing=stride,
     )
-    aligned = sample_runtime_history(
+    legacy = sample_runtime_history(
         positions,
         yaws,
         num_history_poses=count,
         waypoints_spacing=stride,
-        mode="training_aligned",
         tick_hz=10,
     )
-    np.testing.assert_array_equal(aligned.positions, training.positions)
-    np.testing.assert_array_equal(aligned.yaws, training.yaws)
-    np.testing.assert_array_equal(aligned.time_offsets_seconds, -aligned.tick_ages / 10)
+    np.testing.assert_array_equal(legacy.positions, training.positions)
+    np.testing.assert_array_equal(legacy.yaws, training.yaws)
+    np.testing.assert_array_equal(legacy.time_offsets_seconds, -legacy.tick_ages / 10)
 
 
 @pytest.mark.parametrize(

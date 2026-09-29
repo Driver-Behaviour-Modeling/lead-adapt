@@ -3,9 +3,10 @@
 Expert metadata reverses BaseAgent's tick-by-tick queues when saving them; it
 does not downsample their contents. Thus metadata index 5 is five simulation
 ticks old, even though metadata files themselves are saved every five ticks.
-Training excludes the current pose and ends one waypoint interval in the past.
-The legacy runtime window includes the current pose. Both contracts are explicit
-here so a checkpoint can be evaluated with a single controlled timing change.
+Training and the legacy runtime window both end at the current pose, so every
+history delta and the first future delta span one waypoint interval. The
+training_aligned runtime window ends one interval in the past; it reproduces the
+history of checkpoints trained before the current pose was included.
 """
 
 from dataclasses import dataclass
@@ -116,9 +117,10 @@ def sample_training_history(
     waypoints_spacing: int,
     tick_hz: float = 20.0,
 ) -> HistoryFeatures:
-    """Select saved newest-first metadata with the existing training convention.
+    """Select saved newest-first metadata with the training convention.
 
-    For five poses and spacing five this returns ages [25, 20, 15, 10, 5].
+    For five poses and spacing five this returns ages [20, 15, 10, 5, 0]: the
+    history ends at the current pose, which is also where the future starts.
     Unavailable startup samples are omitted, matching the existing dataloader.
     Sensor perturbation remains the dataloader's responsibility after sampling.
     """
@@ -127,7 +129,7 @@ def sample_training_history(
         past_yaws,
         num_history_poses=num_history_poses,
         waypoints_spacing=waypoints_spacing,
-        newest_tick_age=waypoints_spacing,
+        newest_tick_age=0,
         newest_first=True,
         pad_to_length=False,
         tick_hz=tick_hz,
@@ -146,8 +148,9 @@ def sample_runtime_history(
     """Sample oldest-first BaseAgent queues, padding unavailable startup history.
 
     ``legacy`` exactly retains the existing runtime values: ages [20, 15, 10, 5,
-    0] for five poses at spacing five. ``training_aligned`` uses [25, 20, 15, 10,
-    5], matching saved training inputs once the queue contains enough ticks.
+    0] for five poses at spacing five, matching the training convention.
+    ``training_aligned`` uses [25, 20, 15, 10, 5], the training inputs of
+    checkpoints trained before the current pose was included.
     Changing the sampling mode does not change the current-ego coordinate frame.
     """
     if mode not in ("legacy", "training_aligned"):

@@ -322,14 +322,19 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         input_data: dict,
         pop_distance: float,
         *,
-        closed_loop=None,
+        closed_loop: typing.Any = None,
         record_trace: bool = True,
-    ):
+    ) -> dict:
         """Defines local planning signals based on the input data.
 
         Args:
             input_data: The input data containing sensor information and state. Will be fed into model.
             pop_distance: Distance threshold to pop waypoints from the route planner.
+            closed_loop: Closed-loop config to use instead of the agent's own.
+            record_trace: If true store the trace as the current navigation trace.
+
+        Returns:
+            Trace of the navigation decision for diagnostics.
         """
         planner: RoutePlanner = self.gps_waypoint_planners_dict[pop_distance]
 
@@ -652,7 +657,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             )[None]
 
         # Both timing conventions are explicit: legacy includes the current
-        # pose, while training_aligned ends one waypoint interval in the past.
+        # pose (the training convention), while training_aligned ends one
+        # waypoint interval in the past (checkpoints trained before that change).
         history = None
         if getattr(self.training_config, "use_adapt_decoder", False):
             history = sample_runtime_history(

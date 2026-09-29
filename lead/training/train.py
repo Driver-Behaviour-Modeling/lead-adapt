@@ -198,6 +198,15 @@ class Trainer:
     @beartype
     def train(self) -> float | None:
         self.model_wrapper.train()
+        if self.config.adapt_train_token_decoder_only:
+            # Frozen modules stay in eval mode: BatchNorm statistics must not
+            # drift, so route/speed control stays identical to the loaded model.
+            # AdaptDecoder.forward selects teacher forcing from its own flag, so
+            # set it without recursing into its frozen submodules. Left False,
+            # the decoder would roll out and train CE against its own argmax.
+            self.model.eval()
+            self.model.adapt_decoder.training = True
+            self.model.adapt_decoder.transformer_decoder.train()
 
         with prepared_training_batches(
             islice(self.dataloader, self.gradient_steps_per_epoch),
@@ -243,14 +252,33 @@ class Trainer:
                 # Important to backprop outside the autocast context
                 self.scaler.scale(loss).backward()
 
+                # Unscale (no-op without a scaler) so the norm and clipping see
+                # true gradients. DDP has already all-reduced them, so every
+                # rank computes the same norm and makes the same skip decision.
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model_wrapper.parameters(),
+                    self.config.grad_clip_norm or float("inf"),
+                )
+                log["debug/grad_norm"] = grad_norm
+
                 # Gradient step
                 scale_before = self.scaler.get_scale()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.gradient_steps_skipped += int(
-                    scale_before > self.scaler.get_scale(),
-                )  # Count how many times the scale changed
-                if not (scale_before > self.scaler.get_scale()):
+                if not self.scaler.is_enabled() and not torch.isfinite(grad_norm):
+                    # bf16 has no GradScaler to catch overflow: without this a
+                    # single NaN batch is written straight into the weights.
+                    LOG.warning(
+                        f"Skipping step {self.step}: non-finite gradient norm "
+                        f"(loss {loss.item()}).",
+                    )
+                    stepped = False
+                else:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    # A scale backoff means the scaler skipped the step.
+                    stepped = not (scale_before > self.scaler.get_scale())
+                self.gradient_steps_skipped += int(not stepped)
+                if stepped:
                     self.scheduler.step(
                         self.gradient_steps_per_epoch * self.cur_epoch
                         + epoch_iteration,

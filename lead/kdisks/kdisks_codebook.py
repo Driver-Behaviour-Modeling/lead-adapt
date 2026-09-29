@@ -75,12 +75,31 @@ class KDisksCodebook(nn.Module):
 
         self.num_embeddings = len(centroids)
         self.embedding_dim = 3  # (Δx, Δy, Δheading)
+        # Codebooks built before the body-frame fix carry no frame tag. Their
+        # checkpoints were trained on current-ego-frame differences, which
+        # KDisksModel._compute_deltas reproduces for them.
+        self.frame = self._info.get("frame", "current_ego_legacy")
 
     def _load_vocabulary(self, path: str) -> tuple[np.ndarray, dict]:
-        """Load K-disks vocabulary from file."""
+        """Load K-disks vocabulary from file.
+
+        Refuses codebooks clustered with a different heading weight than the one
+        used for lookup, which assigns tokens with the wrong metric while the
+        numbers stay plausible.
+        """
         with open(path, "rb") as f:
             data = pickle.load(f)
-        return data["centroids"], data["info"]
+        info = data["info"]
+        if "heading_weight" in info and not np.isclose(
+            info["heading_weight"],
+            self.heading_weight,
+        ):
+            raise ValueError(
+                f"Codebook at {path} was clustered with heading_weight="
+                f"{info['heading_weight']}, but kdisks_heading_weight="
+                f"{self.heading_weight}.",
+            )
+        return data["centroids"], info
 
     @property
     def vocab_size(self) -> int:
@@ -256,7 +275,7 @@ class KDisksModel(nn.Module):
         # Initialize codebook
         self.codebook = KDisksCodebook(
             vocab_path=config.kdisks_vocab_path,
-            heading_weight=getattr(config, "kdisks_heading_weight", 1.0),
+            heading_weight=config.kdisks_heading_weight,
             normalize=getattr(config, "normalize_kinematics", True),
         )
 
@@ -270,7 +289,14 @@ class KDisksModel(nn.Module):
 
     def _compute_deltas(self, poses: torch.Tensor) -> torch.Tensor:
         """
-        Compute frame-to-frame delta transformations.
+        Compute frame-to-frame deltas in the body frame at the start of each step.
+
+        Must match compute_deltas() in scripts/extract_lead_carla_deltas.py, which
+        the codebook is clustered from. ``poses`` share one frame (the current ego
+        frame), so each displacement is rotated by the negated heading at the
+        start of its step, giving the SE(2) relative transform T_k^-1 . T_{k+1}.
+        Δheading is frame-independent and needs no rotation. Legacy codebooks
+        (no frame tag) get the unrotated differences their checkpoints used.
 
         Args:
             poses: [batch_size, num_frames, 3] where 3 = (x, y, heading)
@@ -278,10 +304,17 @@ class KDisksModel(nn.Module):
         Returns:
             deltas: [batch_size, num_frames-1, 3] where 3 = (Δx, Δy, Δheading)
         """
-        delta_x = poses[:, 1:, 0] - poses[:, :-1, 0]
-        delta_y = poses[:, 1:, 1] - poses[:, :-1, 1]
-        delta_heading = poses[:, 1:, 2] - poses[:, :-1, 2]
-        delta_heading = wrap_angle_torch(delta_heading)
+        dx = poses[:, 1:, 0] - poses[:, :-1, 0]
+        dy = poses[:, 1:, 1] - poses[:, :-1, 1]
+
+        delta_heading = wrap_angle_torch(poses[:, 1:, 2] - poses[:, :-1, 2])
+        if self.codebook.frame != "body":
+            return torch.stack([dx, dy, delta_heading], dim=-1)
+
+        psi = poses[:, :-1, 2]  # heading at the start of each step
+        cos_psi, sin_psi = torch.cos(psi), torch.sin(psi)
+        delta_x = cos_psi * dx + sin_psi * dy
+        delta_y = -sin_psi * dx + cos_psi * dy
 
         return torch.stack([delta_x, delta_y, delta_heading], dim=-1)
 

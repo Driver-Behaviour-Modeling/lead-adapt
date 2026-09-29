@@ -188,6 +188,16 @@ def initialize_model(
             )
 
     model.backbone.requires_grad_(not config.freeze_backbone)
+    if config.adapt_train_token_decoder_only:
+        # Scheduled sampling would fit per-step marginals, not the autoregressive
+        # conditionals the token distribution must represent.
+        if config.use_scheduled_sampling:
+            raise ValueError(
+                "adapt_train_token_decoder_only requires pure teacher forcing",
+            )
+        model.requires_grad_(False)
+        model.adapt_decoder.transformer_decoder.requires_grad_(True)
+        model.adapt_decoder.output_projection.requires_grad_(True)
     LOG.info(
         f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters",
     )
