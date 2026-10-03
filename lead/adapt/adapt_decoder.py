@@ -276,6 +276,14 @@ class AdaptDecoder(nn.Module):
         self.waypoints_from_tokens = config.adapt_waypoints_from_tokens
         if self.waypoints_from_tokens and self.kdisks_model.codebook.frame != "body":
             raise ValueError("adapt_waypoints_from_tokens needs a body-frame codebook")
+        self.decoding = config.adapt_decoding
+        self.beam_width = config.adapt_beam_width
+        if self.decoding not in ("greedy", "beam", "expected"):
+            raise ValueError(f"Unknown adapt_decoding: {self.decoding!r}")
+        if self.decoding != "greedy" and not self.waypoints_from_tokens:
+            raise ValueError(
+                f"adapt_decoding={self.decoding!r} needs adapt_waypoints_from_tokens",
+            )
         self._num_history_poses = self.config.num_history_poses
         self._num_future_poses = self.config.num_way_points_prediction
 
@@ -424,6 +432,52 @@ class AdaptDecoder(nn.Module):
 
         # Scheduled-sampling probability — bumped by the training loop if used.
         self._ss_prob = 0.0
+
+    def _beam_search(
+        self,
+        prefix_tokens: torch.Tensor,
+        encoder_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Approximate the most likely future token sequence under the model.
+
+        Fixed-length beam search over ``_num_future_poses`` steps, scoring beams by
+        their summed log-probability. With width 1 it equals greedy decoding.
+
+        Args:
+            prefix_tokens: History tokens [B, P] the rollout continues from.
+            encoder_context: Cross-attention memory [B, N, D].
+
+        Returns:
+            The best beam's future tokens [B, T] and its per-step logits [B, T, V].
+        """
+        bs, width = prefix_tokens.shape[0], self.beam_width
+        device = prefix_tokens.device
+        context = encoder_context.repeat_interleave(width, dim=0)
+        tokens = prefix_tokens.repeat_interleave(width, dim=0)
+        # All beams start identical: keep only the first so step 0 picks distinct tokens.
+        scores = torch.full((bs, width), float("-inf"), device=device)
+        scores[:, 0] = 0.0
+        offsets = torch.arange(bs, device=device).unsqueeze(1) * width
+        step_logits: list[torch.Tensor] = []
+        for _ in range(self._num_future_poses):
+            decoder_output = self.transformer_decoder(
+                tgt_token_ids=tokens,
+                encoder_output=context,
+                self_attention_mask=generate_causal_mask(tokens.shape[1], device),
+            )
+            logits = self.output_projection(decoder_output[:, -1]).float()
+            vocab = logits.shape[-1]
+            log_probs = torch.log_softmax(logits, dim=-1).view(bs, width, vocab)
+            candidates = (scores.unsqueeze(-1) + log_probs).view(bs, width * vocab)
+            scores, flat = candidates.topk(width, dim=-1)
+            source = (flat // vocab + offsets).view(-1)
+            tokens = torch.cat([tokens[source], (flat % vocab).view(-1, 1)], dim=1)
+            step_logits = [step_logit[source] for step_logit in step_logits] + [
+                logits[source],
+            ]
+        best = offsets.squeeze(1)  # topk is sorted, so beam 0 is the best
+        future_tokens = tokens[best, prefix_tokens.shape[1] :].contiguous()
+        return future_tokens, torch.stack(step_logits, dim=1)[best]
 
     def _decode_plan_queries(
         self,
@@ -593,6 +647,7 @@ class AdaptDecoder(nn.Module):
         # ----------------------------------------------------------------------
         # 5. Autoregressive decode
         # ----------------------------------------------------------------------
+        rollout_tokens = None
         if self.training and future_token_ids is not None:
             T_future = future_token_ids.shape[1]
 
@@ -662,7 +717,7 @@ class AdaptDecoder(nn.Module):
             all_logits_list = []
             all_hidden_list = []
 
-            for _ in range(T_future):
+            for _ in range(0 if self.decoding == "beam" else T_future):
                 seq_len = generated_tokens.shape[1]
                 causal_mask = generate_causal_mask(seq_len, device)
 
@@ -681,19 +736,37 @@ class AdaptDecoder(nn.Module):
                     dim=1,
                 )
 
-            output_logits = torch.cat(all_logits_list, dim=1)
-            future_hidden_states = torch.cat(all_hidden_list, dim=1)
+            if self.decoding == "beam":
+                rollout_tokens, output_logits = self._beam_search(
+                    kinematic_tokens,
+                    encoder_context,
+                )
+                future_hidden_states = None
+            else:
+                output_logits = torch.cat(all_logits_list, dim=1)
+                future_hidden_states = torch.cat(all_hidden_list, dim=1)
+                rollout_tokens = generated_tokens[
+                    :,
+                    kinematic_tokens.shape[1] :,
+                ].contiguous()
 
         # ----------------------------------------------------------------------
         # 6. Trajectory — either the MLP head over concatenated hidden states, or
-        # the argmax token rollout integrated from the current pose.
+        # the decoded token rollout integrated from the current pose. Under
+        # teacher forcing (no rollout) the argmax of each step is integrated.
         # ----------------------------------------------------------------------
         if self.waypoints_from_tokens:
-            argmax_deltas = self.kdisks_model.decode(output_logits.argmax(dim=-1))
-            trajectory = integrate_body_frame_deltas(
-                argmax_deltas.float(),
-                history_poses[:, -1],
-            )
+            if rollout_tokens is not None and self.decoding == "expected":
+                centroids = self.kdisks_model.codebook.centroids.float()
+                deltas = torch.softmax(output_logits.float(), dim=-1) @ centroids
+            else:
+                tokens = (
+                    rollout_tokens
+                    if rollout_tokens is not None
+                    else output_logits.argmax(dim=-1)
+                )
+                deltas = self.kdisks_model.decode(tokens).float()
+            trajectory = integrate_body_frame_deltas(deltas, history_poses[:, -1])
         else:
             concat_hidden = future_hidden_states.reshape(bs, -1)
             trajectory_flat = self._trajectory_head(concat_hidden)
@@ -737,7 +810,7 @@ class AdaptDecoder(nn.Module):
         # with the AR samples so the dataclass contract is honoured. These are
         # not used for any loss in that mode.
         if future_token_ids is None:
-            future_token_ids = output_logits.argmax(dim=-1)
+            future_token_ids = rollout_tokens
 
         # Cast user-facing outputs to fp32 — autocast may have produced bf16,
         # which downstream consumers (visualizer .numpy() in particular) reject.

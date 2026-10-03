@@ -739,6 +739,14 @@ class TrainingConfig(BaseConfig):
     # Produce pred_future_waypoints/pred_headings by integrating the argmax AR
     # token rollout instead of the trajectory MLP (whose losses are disabled).
     adapt_waypoints_from_tokens = False
+    # How the AR token rollout is decoded at inference (training is unaffected):
+    # "greedy" feeds back the argmax token each step; "beam" returns the most
+    # likely future token sequence found by beam search; "expected" runs the
+    # greedy rollout but integrates each step's probability-weighted delta.
+    # Needs adapt_waypoints_from_tokens. Override per eval via LEAD_TRAINING_CONFIG.
+    adapt_decoding = "greedy"
+    # Beam width for adapt_decoding="beam".
+    adapt_beam_width = 8
     # Path to the K-disks vocabulary pickle produced by
     # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
     # Checkpoints trained before the body-frame fix store the legacy

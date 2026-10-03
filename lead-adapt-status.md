@@ -55,6 +55,32 @@ Other configurations (n_min = 50) were strictly worse on cover. Pose glitches (|
 
 ## Current run and follow-ups
 
+### Runs at a glance (AR-decoding view)
+
+Token decoding at inference is the same for every token run:
+- The prefix is 4 true history tokens (ages 20→15→10→5→0 ticks).
+- Then 8 steps: logits → **argmax** token → its embedding is fed back → next step.
+- The 8 argmax centroids (body-frame deltas) are integrated from the current pose into 8 waypoints at 0.25 s spacing, re-planned at every control step.
+
+| Run | Start | What trains | AR decoder training | Codebook | Driving trajectory | B2D DS |
+|---|---|---|---|---|---|---|
+| navcond (`adapt_radar_navcond_v1_retry1`) | chain: pretrain → 60 → 40 → 15 epochs | everything | hard CE + MLP trajectory L1/Fréchet, **scheduled sampling to 1.0 (argmax feedback)** | old: 4096 codes, current-frame deltas | route + speed heads (non-AR queries) | 88.9 |
+| `navcond_waypoint` | same checkpoint | — | — | — | **trajectory MLP** on the AR hidden states of the greedy rollout (MLP trained on rollout states via SS) | 84.9 |
+| v2 | navcond `model_0014` | token decoder only (rest frozen, eval mode) | hard CE, **pure teacher forcing**, 3 ep, lr 1e-4 | new: 1234 codes, body frame | integrated argmax token rollout | 62.6 |
+| v3 | v2 `model_0002` | token decoder only | same, +3 ep, lr 5e-5 | new | integrated argmax rollout | 64.4 |
+| `full_v1` (waypoint) | v3 `model_0002` | everything but the unused MLP | CE + all perception/route/speed losses, pure TF, 5 ep, lr 2e-5 | new | integrated argmax rollout | 67.1 |
+| `full_v1` (route) | same checkpoint | — | — | — | route + speed heads | 88.8 |
+| `adapt_fresh_posttrain_v1` (running) | LEAD pretrain `model_0030` (perception only) | everything; decoder, route/speed, navigation from scratch | CE + all losses, pure TF, 30 ep, lr 1e-4, cuDNN SDPA off | new | — (not yet evaluated) | — |
+
+**Decoding options (uncommitted, inference only).**
+- `adapt_decoding = greedy | beam | expected` (default `greedy`) and `adapt_beam_width` (default 8). Set per eval with `LEAD_TRAINING_CONFIG="adapt_decoding=beam"`; the agent applies it over the checkpoint's `config.json`.
+- **Beam** returns the most likely 8-token sequence under P. This is the paper-consistent planner: the car drives the mode of the same density the score uses.
+- **Expected** is a per-step mean, which averages modes, so it is an ablation only.
+- Tests: width 1 equals greedy, and an exhaustive width finds the brute-force most likely sequence.
+- `scripts/eval_open_loop_rollout.py` (Step A) reports the per-horizon error of the GT-token floor, teacher forcing, each decoding and a reference checkpoint, plus token accuracy and teacher-forced NLL.
+
+Training token CE (train set, last epoch): v2 1.13, v3 1.05, `full_v1` 0.99, fresh 0.92 at epoch 20.
+
 **v1 failed:** `adapt_token_decoder_v1` (launched 2026-09-29 04:28, `EXTRA_CONFIG="epochs=6"`, wandb `wjavav2a`) ran all 45,408 steps but the token CE went NaN at step 18,078 (epoch 2) and stayed NaN. Up to then it was healthy: CE 1.58 → 1.18 mean over epochs 0–1 (≈ 1.0 at the end of epoch 1), token accuracy up to 70%; the loss was steady at ≈ 1.0 right up to the NaN, so it was a single bad step, not a slow blow-up. The only surviving checkpoint (`model_0005.pth`) has NaN in all 113 token-decoder and output-projection tensors (frozen modules are fine). Do not evaluate it.
 
 Causes:
@@ -64,7 +90,59 @@ Causes:
 
 Fixes (uncommitted): `train.py` unscales, computes the global grad norm (logged as `debug/grad_norm`), clips to `grad_clip_norm`, and skips the step when the norm is non-finite and no GradScaler is active. New config keys `grad_clip_norm` (default None) and `keep_all_epoch_checkpoints` (default false). The launch script now sets `grad_clip_norm=1.0 keep_all_epoch_checkpoints=true epochs=3`, `RUN_NAME` defaults to `adapt_token_decoder_v2`, and it has an `#SBATCH` header (`h100-full`, QOS `professor-fullgpu-limited`, the full H100 NVL).
 
-**Next run:** `adapt_token_decoder_v2`, launched directly on the full H100 from the repo root: `CUDA_VISIBLE_DEVICES=GPU-4ec20303-3c97-fc1c-9499-e5539efe3717 nohup bash scripts/posttrain_token_decoder.sh > outputs/adapt_token_decoder_v2.log 2>&1 &`. Pin the GPU by UUID: `CUDA_VISIBLE_DEVICES=1` selects a 10 GiB MIG slice, not the second H100 (log `outputs/adapt_token_decoder_v2.log`, checkpoints in `outputs/local_training/adapt_token_decoder_v2/`, 3 × 7,568 steps ≈ 3.5 h).
+**v2 and v3 (done, healthy):**
+
+| Run | Start | Epochs, lr | Token CE per epoch | Token accuracy | Skipped non-finite steps |
+|---|---|---|---|---|---|
+| `adapt_token_decoder_v2` | navcond `model_0014` | 3, 1e-4 | 1.55 → 1.19 → 1.13 | 0.57 → 0.64 | 0 |
+| `adapt_token_decoder_v3` | v2 `model_0002` | 3, 5e-5 | 1.11 → 1.07 → 1.05 | 0.64 → 0.65 | 91 (guard worked) |
+
+All `model_0002.pth` weights are finite. **Latest: v3 `model_0002.pth`**. v2 `model_0002` is on Hugging Face (`Divyanshudiv/ADAPT`, model repo, `adapt_token_decoder_v2/`). The waypoint-modality eval of v2 (`outputs/eval_v2_e2.log`) stopped after 1 of 220 routes. Clipping at 1.0 is active on most steps (mean pre-clip grad norm ≈ 1.1).
+
+**Full fine-tune (next):** start from v3 `model_0002`, set `adapt_train_token_decoder_only=false`, 5 epochs, lr 2e-5 (the navcond post-train lr), keeping grad clipping, pure teacher forcing and waypoints from tokens. A dry run confirmed 73.9 M of 76.0 M parameters trainable (all but the unused trajectory MLP). All losses are weighted equally (token CE ≈ 0.08 of the total, like every perception and route/speed term). The run name is `adapt_token_full_v1`.
+
+**`adapt_token_full_v1` (done):** token CE 1.065 → 0.991, accuracy 0.668, route and speed losses improving. The final `model_0004` is finite and uploaded to HF. But skipped steps rose every epoch (178, 196, 793, 1004, 1015; 13% of the last epoch).
+
+**Root cause of skipped steps (fixed, uncommitted):** the **cuDNN attention backend in torch 2.5.0** returns non-finite gradients from the ADAPT decoder's bf16 attention backward.
+- Every skipped step had a finite loss.
+- Per-loss attribution at the final weights: 44/300 steps non-finite, all from `loss_kinematic_token`, then propagating into the backbone and radar.
+- On 8 bad batches with a fixed dropout seed, re-running reproduced the failure each time. Each became finite with cuDNN SDPA excluded and with math SDPA.
+- Fix: `torch.backends.cuda.enable_cudnn_sdp(False)` in `training_utils.initialize_torch` (off by default from torch 2.5.1). With it: 0/300 non-finite, 0.949 s vs 0.877 s per step (≈ 6% more useful updates per hour, since 13–15% of cuDNN steps were discarded).
+- The token-only runs saw little of this (v2: 0, v3: 91) because only the decoder received gradients. The checkpoints already trained are valid; skipped steps only drop updates.
+
+**Held-out data caveat:** every run so far (navcond, v1–v3) trained on the full post-train buckets, *including* Town13. Town13 is therefore not held out. A fair NLL comparison between v3 and the full fine-tune needs data neither model saw (for example BADCAR's normal drives), or both retrained with `hold_out_town13_routes=true`.
+
+**Closed-loop eval: v2 driving from its tokens** (Bench2Drive-220, waypoint modality for steer/throttle/brake, run on the ADAPT machine, 2026-10-01). The first attempt failed because `CARLA_ROOT` pointed at a missing `carla_0.9.16`.
+
+| | v2, token rollout (waypoint mode) | navcond, route + target speed |
+|---|---|---|
+| Driving score | 61.7 (217/220 routes; current 62.6) | 88.9 |
+| Success rate | 29.5% | 70.9% |
+| Route completion / penalty | 85.3 / 0.73 | 92.4 / 0.96 |
+| Layout / vehicle / pedestrian collisions | 74 / 102 / 5 | 1 / 12 / 0 |
+| Outside lanes / blocked / TickRuntime | 61 / 22 / 18 | 7 / 4 / 3 |
+| Route deviation / red light | 38 / 5 | 34 / 4 |
+
+Navigation intent and rules are about as good as navcond (route deviation and red lights barely change). The loss is in tracking and interaction: collisions, lane departures, and turns, parking exits and control loss at 21–35 DS. **Confound:** waypoint mode uses the old TransFuser controller (one aim point and PID; speed from the distance between the 0.5 s and 1 s waypoints), not LEAD's route controller. Control experiment: navcond in waypoint mode. Then v3 and `adapt_token_full_v1` in waypoint mode.
+
+**Closed-loop eval round 2 (ADAPT machine, Bench2Drive-220, 2026-10-03):**
+
+| Run | Driver | n | DS (cur) | SR % | RC | Penalty | Layout / vehicle collisions | Outside lanes | Route dev |
+|---|---|---|---|---|---|---|---|---|---|
+| navcond (other box) | route + speed heads | 220 | 88.9 | 70.9 | 92.4 | 0.96 | 1 / 12 | 7 | 34 |
+| `full_v1_route` | route + speed heads | 220 | **88.8** | **72.3** | 92.5 | 0.96 | 1 / 15 | 1 | 34 |
+| `navcond_waypoint` | old MLP waypoints | 219 | 84.9 | 62.3 | 90.9 | 0.93 | 2 / 19 | 9 | 36 |
+| v2 | token rollout | 217 | 62.6 | 29.5 | 85.3 | 0.73 | 74 / 102 | 61 | 38 |
+| v3 | token rollout | 217 | 64.4 | 31.8 | 86.6 | 0.74 | 62 / 95 | 48 | 40 |
+| `full_v1_waypoint` | token rollout | 220 | 67.1 | 30.9 | 87.9 | 0.77 | 52 / 80 | 57 | 36 |
+
+- **The full fine-tune keeps the driving policy:** 88.8 vs 88.9 DS (within eval noise), with slightly higher success.
+- **The waypoint controller costs only ~4 DS** (navcond 88.9 → 84.9). It is **not** the main reason the token rollout is weak, so that confound is largely ruled out.
+- **The token rollout trails the MLP waypoints by ~18 DS under the same controller.** The loss is collisions (layout, vehicle) and lane departures. Route deviation and red lights are on par.
+- **Rollout driving improves as token CE falls** (1.13 → 1.05 → 0.99 gives 62.6 → 64.4 → 67.1).
+- **Remaining suspects:** exposure bias (pure teacher forcing vs the scheduled-sampling-trained MLP head), greedy argmax decoding, and quantization drift integrated over 8 steps.
+
+**Earlier: v2 launch command.** `adapt_token_decoder_v2` was launched directly on the full H100 from the repo root: `CUDA_VISIBLE_DEVICES=GPU-4ec20303-3c97-fc1c-9499-e5539efe3717 nohup bash scripts/posttrain_token_decoder.sh > outputs/adapt_token_decoder_v2.log 2>&1 &`. Pin the GPU by UUID: `CUDA_VISIBLE_DEVICES=1` selects a 10 GiB MIG slice, not the second H100 (log `outputs/adapt_token_decoder_v2.log`, checkpoints in `outputs/local_training/adapt_token_decoder_v2/`, 3 × 7,568 steps ≈ 3.5 h).
 
 **After it finishes:**
 1. **Held-out token NLL per checkpoint.** Measure it on the Town13 routes (a normal held-out loss, not the calibration experiments). Use it to pick the checkpoint and to judge whether 6 epochs was enough. The trainer has no validation loop, so this script still has to be written.
