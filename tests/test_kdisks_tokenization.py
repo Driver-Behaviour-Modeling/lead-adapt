@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from lead.adapt.adapt_decoder import integrate_body_frame_deltas
@@ -97,7 +98,13 @@ def test_waypoints_from_tokens_integrate_the_argmax_rollout(tmp_path):
     torch.testing.assert_close(out["trajectory"], expected)
 
 
-def _body_frame_decoder(tmp_path, decoding: str, beam_width: int = 8):
+def _body_frame_decoder(
+    tmp_path,
+    decoding: str,
+    beam_width: int = 8,
+    history_free: bool = False,
+    rolling: bool = False,
+):
     import pickle
 
     from lead.adapt.adapt_decoder import AdaptDecoder
@@ -117,6 +124,8 @@ def _body_frame_decoder(tmp_path, decoding: str, beam_width: int = 8):
     config.adapt_waypoints_from_tokens = True
     config.adapt_decoding = decoding
     config.adapt_beam_width = beam_width
+    config.adapt_history_free = history_free
+    config.adapt_rolling_tokenization = rolling
     torch.manual_seed(3)
     return AdaptDecoder(8, config, torch.device("cpu")).eval()
 
@@ -177,3 +186,61 @@ def test_exhaustive_beam_finds_the_most_likely_sequence(tmp_path):
                 atol=0,
                 rtol=0,
             )
+
+
+def test_rolling_tokenization_recovers_reachable_codes_and_corrects_offsets():
+    from lead.adapt.adapt_decoder import AdaptDecoder
+
+    model = SimpleNamespace(kdisks_model=KDisksModel(CONFIG), rolling_beam_width=32)
+    centroids = model.kdisks_model.codebook.centroids
+    origin = torch.zeros(1, 3)
+    # A trajectory made exactly of codebook steps is tokenized back to its codes.
+    codes = torch.tensor([[40, 41, 42, 43, 44, 45, 46, 47]])
+    path = integrate_body_frame_deltas(centroids[codes], origin)
+    tokens, _ = AdaptDecoder._rolling_tokens(model, origin, path)
+    torch.testing.assert_close(tokens, codes, atol=0, rtol=0)
+    # A straight 8 m/s path seen from a start shifted 0.4 m sideways (as under
+    # sensor perturbation): per-step tokenization keeps the offset for the whole
+    # horizon, sequential tokenization steers back towards the path.
+    straight = torch.stack(
+        [torch.tensor([2.0 * (k + 1), 0.0, 0.0]) for k in range(8)],
+    ).unsqueeze(0)
+    start = torch.tensor([[0.0, 0.4, 0.0]])
+    rolled, _ = AdaptDecoder._rolling_tokens(model, start, straight)
+    rolled_end = integrate_body_frame_deltas(centroids[rolled], start)[0, -1]
+    independent = model.kdisks_model.encode(
+        model.kdisks_model._compute_deltas(
+            torch.cat([start[:, None], straight], dim=1),
+        ),
+    )
+    independent_end = integrate_body_frame_deltas(centroids[independent], start)[0, -1]
+    assert abs(rolled_end[1]) < 0.1 < abs(independent_end[1])
+
+
+@pytest.mark.parametrize("decoding", ["greedy", "beam", "expected"])
+def test_history_free_decoder_needs_no_history(tmp_path, decoding):
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_navigation_conditioning import sample
+
+    model = _body_frame_decoder(tmp_path, decoding, history_free=True, rolling=True)
+    assert not hasattr(model, "history_pose_proj")
+    data = sample()
+    del data["past_positions"], data["past_yaws"]
+    bev = torch.randn(2, 8, 2, 3)
+    with torch.inference_mode():
+        out = model(bev, None, None, data, {})
+    assert out["output_logits"].shape == (2, 4, 8)
+    assert out["future_token_ids"].max() < 8  # the start token is never emitted
+    start = torch.zeros(2, 3)
+    if decoding != "expected":
+        expected = integrate_body_frame_deltas(
+            model.kdisks_model.codebook.centroids[out["future_token_ids"]],
+            start,
+        )
+        torch.testing.assert_close(out["trajectory"], expected)
+    model.train()
+    out = model(bev, None, None, data, {})
+    losses = {}
+    model.compute_loss(data, out, losses, {})
+    losses["loss_kinematic_token"].backward()
+    assert torch.isfinite(losses["loss_kinematic_token"])

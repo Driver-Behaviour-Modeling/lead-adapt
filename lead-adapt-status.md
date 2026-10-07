@@ -29,7 +29,7 @@ State of the ADAPT decoder in `lead-adapt`, and what has been changed so that it
 | B3 codebook | Clustering ported from navsim: minimum cluster size, reserved stationary token, plausibility bounds rescaled to 0.25 s steps, no single-sample padding, perplexity and `frame='body'` recorded. Heading weight = CARLA ego half-diagonal √(2.451² + 1.064²) = 2.672 m/rad. | `lead/kdisks/kdisks_clustering.py`, `scripts/build_kdisks_carla.py` |
 | Delta extraction | Parallel, and restricted to the routes the training buckets use (failed or unfinished routes are not normative). Writes `lead/adapt/data/carla_deltas_valid_routes.npy` (1,099,472 deltas from 8,718 of 9,715 routes). Global poses were checked against the dataloader's ego-frame futures: they agree to ~1 mm. | `scripts/extract_lead_carla_deltas.py` |
 | New codebook | `lead/adapt/codebooks/kdisks_carla_body.pkl`: 1,234 codes, 26,057 samples below `min_cluster_size` (they snap to the nearest code), stationary token holds 331,874 samples (~30%). Old `kdisks_carla.pkl` and `carla_deltas.npy` untouched. | — |
-| Config | Defaults now point at the new codebook (`kinematic_vocab_size = 1234`, heading weight 2.672). New flags `adapt_train_token_decoder_only` (freeze everything but the token decoder, CE-only loss weights, refuses scheduled sampling) and `adapt_waypoints_from_tokens`. | `lead/training/config_training.py` |
+| Config | Defaults now point at the new codebook (`kinematic_vocab_size = 1234`, heading weight 2.672). New flags `adapt_train_token_decoder_only` (freeze everything but the token decoder, CE-only loss weights; combinable with scheduled sampling for fine-tuning experiments) and `adapt_waypoints_from_tokens`. | `lead/training/config_training.py` |
 | Freezing | Applied after checkpoint load. Frozen modules are put back in eval mode every epoch, so BatchNorm statistics don't drift. `AdaptDecoder.training` is set on its own (non-recursively), because `forward` uses that flag to choose teacher forcing. The first smoke run missed this: the decoder rolled out and trained CE against its own argmax (loss ≈ 0.005, accuracy 1.0). | `lead/training/training_utils.py`, `lead/training/train.py` |
 | Waypoints from tokens | `integrate_body_frame_deltas` (inverse of `_compute_deltas`) integrates the argmax rollout from the current pose. The trajectory MLP is frozen when this is on. | `adapt_decoder.py` |
 | Launch script | `scripts/posttrain_token_decoder.sh`: 15 epochs, lr 1e-4, single cosine cycle, batch 128. | new |
@@ -141,6 +141,81 @@ Navigation intent and rules are about as good as navcond (route deviation and re
 - **The token rollout trails the MLP waypoints by ~18 DS under the same controller.** The loss is collisions (layout, vehicle) and lane departures. Route deviation and red lights are on par.
 - **Rollout driving improves as token CE falls** (1.13 → 1.05 → 0.99 gives 62.6 → 64.4 → 67.1).
 - **Remaining suspects:** exposure bias (pure teacher forcing vs the scheduled-sampling-trained MLP head), greedy argmax decoding, and quantization drift integrated over 8 steps.
+
+**Closed-loop eval round 3 (decoding, D151, 2026-10-04):** `full_v1` `model_0004`, waypoint modality.
+
+| Decoding | n | DS (cur) | SR % | RC | Layout / vehicle collisions | Outside lanes | Route dev | min/route |
+|---|---|---|---|---|---|---|---|---|
+| greedy | 220 | 67.1 | 30.9 | 87.9 | 52 / 80 | 57 | 36 | 2.3 |
+| beam (width 8) | 219 | 70.3 | 37.7 | 89.0 | 55 / 73 | 41 | 32 | 2.5 |
+| expected | 220 | 71.3 | 40.5 | 89.0 | 47 / 74 | 38 | 32 | 2.3 |
+| reference: navcond MLP waypoints | 219 | 84.9 | 62.3 | 90.9 | 2 / 19 | 9 | 36 | 2.1 |
+
+- Decoding recovers +3 to +4 DS: about a quarter of the ~18 DS gap to the MLP waypoints.
+- Lane departures fall the most (57 → 38–41). Collisions barely move: layout 47–55 vs 2, vehicle 73–80 vs 19. Per-scenario differences rest on 5 routes each and are noisy.
+- Beam costs ~0.2 min per route (no TickRuntime increase).
+- Reading: greedy myopia and quantization are a minor part. The remaining ~14 DS is in the rollout itself (exposure bias or one-step token quality). Step A is the test.
+
+**Fresh post-train, closed loop (D151, epoch 27, route + speed heads):** 88.2 DS, **75.5% success** (best so far), **RC 96.1**, **0 route deviations** (every earlier model had 26–38). But more collisions than `full_v1_route` (layout 10 vs 1, vehicle 29 vs 15, pedestrian 3 vs 0, outside lanes 7 vs 1, blocked 7 vs 3).
+- The navigation failures that motivated the turn diagnostics are gone. Plausible reason: the route/speed heads and navigation conditioning were trained from scratch on the corrected history window ([20…0], matching runtime) instead of inheriting heads trained on [25…5]. This is not isolated by an ablation yet.
+- The extra collisions may reflect fewer route/speed training epochs (30 vs the chain's 115; train route loss 0.053 vs 0.028, target speed 0.31 vs 0.28). It is a single run, so expect ±1–2 DS of eval noise.
+
+**Next experiment: history-free decoder + LEAD recovery labels (`adapt_fresh_histfree_v1`, uncommitted code).** A fresh post-train from LEAD pretrain `model_0030`, identical to `adapt_fresh_posttrain_v1` (30 epochs, lr 1e-4) except:
+- `adapt_history_free=true`: a learned start token replaces the 4 history tokens, history poses leave the encoder context (also for route/speed), and the future starts at the ego origin. Under sensor perturbation (50% of frames; median 0.4 m / 3.5°) the origin is the virtual car, so targets lead back to the expert path, the DART-like signal the route head already gets.
+- `adapt_rolling_tokenization=true` (`adapt_rolling_beam_width=32`): targets are the codebook-step sequence whose reconstruction is closest to the GT poses (summed K-disks distance, beam search). A step-by-step greedy match never recovers from an offset start (turning costs heading error at that step). The sequence match recovers within ~1 s at 8–12 m/s; at 4 m/s only partly.
+- Smoke test: 1.00 s/step (tokenizer cost negligible); trainable 73,879,141.
+- Rationale: copycat / causal confusion (ChauffeurNet past dropout, Wen et al. 2020); LEAD feeds no past positions in CARLA mode; scheduled sampling is improper (Huszár 2015).
+- Compare with fresh at matched epochs (same cosine schedule): Step A rollout ÷ TF ratio (fresh 3.79) and position errors. Token accuracy is not comparable across tokenizers. Then closed loop, waypoint mode with beam.
+- Bundles three changes (no history, origin start, sequence tokenization); the flags allow ablating them later.
+
+**Scheduled-sampling fine-tune arms (whole model, from fresh e29; 2026-10-06; 0 skipped steps).** Arm 1 `adapt_ss_full_v1`: 3 epochs SS 0.25 → 0.5 → 1.0, lr 5e-5. Arm 2 `adapt_ss_full_tf_v1`: arm 1 + 2 epochs TF, lr 2e-5. Step A:
+
+| | TF FDE | Greedy / beam / expected FDE | Greedy ÷ TF | TF NLL (t+1 … t+8) | TF acc t+1 → t+8 |
+|---|---|---|---|---|---|
+| fresh e29 | 0.211 | 0.799 / 0.722 / 0.747 | 3.79 | 0.87 … 0.76 | 0.71 → 0.74 (rising) |
+| arm 1 (SS only) | **0.355** | 0.801 / 0.808 / 0.609 | 2.26 | **1.00 … 1.23** | 0.69 → 0.65 (flat) |
+| arm 2 (SS → TF) | 0.206 | 0.729 / 0.693 / 0.680 | 3.54 | 0.85 … 0.77 | 0.72 → 0.75 |
+
+- **Short SS did not improve the greedy rollout** (0.80 → 0.80). It degraded the teacher-forced conditionals: NLL +0.3 nats, TF error +68%. Arm 1's lower ratio comes from a worse TF, not a better rollout.
+- **The final TF stage is necessary:** arm 2 restores NLL and TF error to fresh's level.
+- **Arm 2 gains only 4–9% on rollout error** (greedy 0.73, beam 0.69), far from `full_v1`'s 0.39 / ratio 1.72.
+- Three SS epochs do not reproduce the inherited robustness. Either much longer SS is needed (the navcond chain had ~115 epochs, plus trajectory-MLP losses on rollout states), or the robustness came from elsewhere in that history. Remaining candidates: decoder warm-start from `full_v1` (lineage test) or CAT-K.
+
+**Step A across checkpoints (2026-10-05): is scheduled sampling behind `full_v1`'s better rollouts?** Greedy rollout vs teacher-forced FDE (m) and token accuracy at t+8.
+
+| Checkpoint | Decoder history | TF FDE | Greedy FDE | Ratio | TF / greedy acc t+8 |
+|---|---|---|---|---|---|
+| v2 | navcond decoder (SS-trained) + 3 TF epochs | 0.275 | 0.506 | 1.84 | 0.636 / 0.512 |
+| v3 | + 3 more TF epochs | 0.246 | 0.424 | 1.72 | 0.653 / 0.518 |
+| `full_v1` | + 5 full-model TF epochs | 0.226 | 0.389 | 1.72 | 0.665 / 0.535 |
+| fresh e29 | from scratch, 30 TF epochs only | 0.211 | 0.799 | 3.79 | 0.741 / 0.490 |
+| navcond | SS → 1.0, old 4096 codebook | — | — | — | TF NLL 8.3 → 5.0 (≈ uniform over 4096 = 8.3) |
+
+- The rollout/teacher gap stays at ~1.7–1.8 across v2 → v3 → `full_v1`; it does not decay with more teacher-forced epochs. Only the from-scratch decoder has ~3.8.
+- Fresh e29's teacher-forced accuracy *rises* with the horizon (0.71 → 0.76), a sign of leaning on the true prefix. The inherited decoders stay flat (~0.65–0.67).
+- Consistent with scheduled-sampling-trained decoder layers carrying rollout robustness, but not isolated. Fresh also differs in context and training length.
+- navcond (SS → 1.0) shows teacher-forced NLL near uniform level. This is **not** clean evidence about scheduled sampling: the evaluation feeds it the new history window ([20…0], trained on [25…5]) and a 0.25 s first future step (trained on 0.5 s, bug B2). The argument against SS as a final stage is theoretical: its targets are the pre-fixed GT tokens regardless of where the model's own prefix led, so the model learns to ignore the prefix (pure argmax-SS → per-step marginals, B4) rather than the conditional or a recovery. CAT-K/DAD instead recomputes the target from the drifted state.
+
+**Fresh post-train, token rollout (D151, epoch 27, beam 8, waypoint modality):** 213/220 routes, **curDS 53.1** (official 51.4), SR 17.3%, RC 77.4, penalty 0.71. Infractions: layout 54, vehicle 100, pedestrian 4, outside lanes 69, route deviation 34, red light 6, **blocked 42**.
+- This is far below `full_v1_beam` (70.3), as Step A predicted: twice the 2 s rollout error.
+- Route deviations (34) match `full_v1`. The fresh route head's 0 deviations do not carry over to the tokens.
+- The many blocked routes (42 vs 17) suggest the rollout collapsing onto the stationary token when its own prefix is off (not yet verified).
+
+**Step A, open-loop rollout analysis (2026-10-05, 2048 fixed post-train frames, augmentation off; `outputs/open_loop/*.json`).** Position error (m) at t+2 / t+4 / t+8 and ADE, plus token accuracy at t+8.
+
+| | t+2 | t+4 | t+8 | ADE | acc t+8 |
+|---|---|---|---|---|---|
+| GT-token floor (both) | 0.024 | 0.046 | 0.099 | 0.054 | — |
+| `full_v1` teacher forced | 0.054 | 0.103 | 0.226 | 0.121 | 0.665 |
+| `full_v1` greedy / beam / expected | 0.061 / 0.063 / 0.052 | 0.142 / 0.135 / 0.121 | 0.389 / 0.363 / 0.340 | 0.185 / 0.175 / 0.160 | 0.535 / 0.550 / 0.535 |
+| fresh e29 teacher forced | 0.061 | 0.110 | 0.211 | 0.122 | 0.741 |
+| fresh e29 greedy / beam / expected | 0.090 / 0.093 / 0.080 | 0.252 / 0.245 / 0.229 | 0.799 / 0.722 / 0.747 | 0.354 / 0.332 / 0.327 | 0.490 / 0.525 / 0.490 |
+| navcond MLP (reference) | 0.170 | 0.148 | 0.212 | 0.178 | — |
+
+- **Exposure bias is confirmed as the main cause of weak token-rollout driving.** The rollout matches teacher forcing at t+1, then diverges with the horizon (`full_v1` FDE 0.39 vs 0.23). Rollout token accuracy decays (0.69 → 0.54) while teacher-forced accuracy stays flat.
+- Greedy myopia (beam) and quantization (GT floor 0.05 ADE) are minor.
+- **Fresh e29 is the better density but the worse roller-out.** Teacher-forced accuracy rises to 0.71–0.76 and NLL falls to 0.68–0.87 (vs 0.84–1.06), but the greedy FDE doubles to 0.80. That is the classic signature: the fresh decoder never saw its own predictions, whereas `full_v1`'s decoder layers descend from navcond's scheduled-sampling-trained decoder.
+- The MLP is worse at t+1 (0.10 vs 0.03) but does not compound (flat 0.15–0.22), which is why it drives better.
 
 **Earlier: v2 launch command.** `adapt_token_decoder_v2` was launched directly on the full H100 from the repo root: `CUDA_VISIBLE_DEVICES=GPU-4ec20303-3c97-fc1c-9499-e5539efe3717 nohup bash scripts/posttrain_token_decoder.sh > outputs/adapt_token_decoder_v2.log 2>&1 &`. Pin the GPU by UUID: `CUDA_VISIBLE_DEVICES=1` selects a 10 GiB MIG slice, not the second H100 (log `outputs/adapt_token_decoder_v2.log`, checkpoints in `outputs/local_training/adapt_token_decoder_v2/`, 3 × 7,568 steps ≈ 3.5 h).
 

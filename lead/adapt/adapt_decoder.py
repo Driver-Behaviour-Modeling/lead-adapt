@@ -286,11 +286,19 @@ class AdaptDecoder(nn.Module):
             )
         self._num_history_poses = self.config.num_history_poses
         self._num_future_poses = self.config.num_way_points_prediction
+        self.history_free = config.adapt_history_free
+        self.rolling_tokenization = config.adapt_rolling_tokenization
+        self.rolling_beam_width = config.adapt_rolling_beam_width
+        if self.history_free and self.kdisks_model.codebook.frame != "body":
+            raise ValueError("adapt_history_free needs a body-frame codebook")
+        # History-free decoding starts from a learned start token, stored as an
+        # extra input embedding row; it is never a prediction target.
+        self._start_token = config.kinematic_vocab_size
 
         # Autoregressive token decoder. Operates at ``kinematic_embed_dim``;
         # cross-attends to ``context_tokens`` from the context encoder.
         self.transformer_decoder = Decoder(
-            kinematic_vocab_size=config.kinematic_vocab_size,
+            kinematic_vocab_size=config.kinematic_vocab_size + int(self.history_free),
             d_model=config.kinematic_embed_dim,
             ffn_hidden=config.decoder_ffn_dim,
             num_heads=config.decoder_num_heads,
@@ -313,7 +321,8 @@ class AdaptDecoder(nn.Module):
         # Fold history poses (x, y, heading) into the cross-attention context.
         # Mirrors ADAPT's ``_history_pose_proj`` so the decoder sees both BEV
         # tokens and continuous past poses.
-        self.history_pose_proj = nn.Linear(3, self.config.kinematic_embed_dim)
+        if not self.history_free:
+            self.history_pose_proj = nn.Linear(3, self.config.kinematic_embed_dim)
 
         # Learned positional embedding over the concatenated encoder context
         # (context_tokens from the encoder + projected history poses). The
@@ -479,6 +488,95 @@ class AdaptDecoder(nn.Module):
         future_tokens = tokens[best, prefix_tokens.shape[1] :].contiguous()
         return future_tokens, torch.stack(step_logits, dim=1)[best]
 
+    def _rolling_tokens(
+        self,
+        start_pose: torch.Tensor,
+        target_poses: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize a future trajectory as the closest sequence of codebook steps.
+
+        Beam search over code sequences from ``start_pose``, minimising the summed
+        K-disks pose distance between the reconstructed and target poses over the
+        horizon. Quantization error therefore does not accumulate, and an offset
+        start (sensor perturbation) is corrected by first turning towards the
+        path, which a step-by-step greedy match never does because the turn
+        costs heading error at that step.
+
+        Args:
+            start_pose: Pose (x, y, heading) the first step starts from [B, 3].
+            target_poses: Ground-truth future poses [B, T, 3], same frame.
+
+        Returns:
+            Token ids [B, T] and, per step, the body-frame delta from the
+            reconstructed pose to the target pose [B, T, 3].
+        """
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            start_pose, target_poses = start_pose.float(), target_poses.float()
+            centroids = self.kdisks_model.codebook.centroids.float()
+            heading_weight = self.kdisks_model.codebook.heading_weight
+            bs, steps, vocab = (
+                target_poses.shape[0],
+                target_poses.shape[1],
+                len(centroids),
+            )
+            poses = start_pose.unsqueeze(1)  # [B, beams, 3]
+            cost = torch.zeros(bs, 1, device=start_pose.device)
+            tokens = torch.zeros(bs, 1, 0, dtype=torch.long, device=start_pose.device)
+            for step in range(steps):
+                cos_h = torch.cos(poses[..., 2:3])
+                sin_h = torch.sin(poses[..., 2:3])
+                candidates = torch.stack(
+                    [
+                        poses[..., 0:1]
+                        + cos_h * centroids[:, 0]
+                        - sin_h * centroids[:, 1],
+                        poses[..., 1:2]
+                        + sin_h * centroids[:, 0]
+                        + cos_h * centroids[:, 1],
+                        poses[..., 2:3] + centroids[:, 2],
+                    ],
+                    dim=-1,
+                )  # [B, beams, V, 3]
+                target = target_poses[:, step, None, None]
+                step_cost = (candidates[..., :2] - target[..., :2]).norm(dim=-1)
+                step_cost = (
+                    step_cost
+                    + heading_weight
+                    * wrap_angle_torch(
+                        candidates[..., 2] - target[..., 2],
+                    ).abs()
+                )
+                total = (cost.unsqueeze(-1) + step_cost).view(bs, -1)
+                cost, flat = total.topk(
+                    min(self.rolling_beam_width, total.shape[1]),
+                    largest=False,
+                )
+                beam = flat // vocab
+                poses = candidates.view(bs, -1, 3).gather(
+                    1,
+                    flat.unsqueeze(-1).expand(-1, -1, 3),
+                )
+                tokens = torch.cat(
+                    [
+                        tokens.gather(
+                            1,
+                            beam.unsqueeze(-1).expand(-1, -1, tokens.shape[2]),
+                        ),
+                        (flat % vocab).unsqueeze(-1),
+                    ],
+                    dim=2,
+                )
+            best = tokens[:, 0]  # topk is sorted, so beam 0 has the lowest cost
+            reconstructed = integrate_body_frame_deltas(centroids[best], start_pose)
+            previous = torch.cat(
+                [start_pose.unsqueeze(1), reconstructed[:, :-1]],
+                dim=1,
+            )
+            deltas = self.kdisks_model._compute_deltas(
+                torch.stack([previous, target_poses], dim=2).flatten(0, 1),
+            ).view(bs, steps, 3)
+        return best, deltas
+
     def _decode_plan_queries(
         self,
         encoder_context: torch.Tensor,
@@ -558,33 +656,44 @@ class AdaptDecoder(nn.Module):
         # registered as float32 buffers and autocast can otherwise downcast
         # ``history_deltas`` to bf16/fp16, leaving ``argmin`` on a mixed-dtype
         # distance matrix.
-        past_positions = (
-            data["past_positions"]
-            .to(
+        if self.history_free:
+            # Scene and current state only: no past motion enters the decoder.
+            kinematic_tokens = torch.full(
+                (bs, 1),
+                self._start_token,
+                dtype=torch.long,
                 device=device,
-                non_blocking=True,
-            )[:, : self._num_history_poses, :2]
-            .float()
-        )
-        past_yaws = (
-            data["past_yaws"]
-            .to(
-                device=device,
-                non_blocking=True,
-            )[:, : self._num_history_poses]
-            .float()
-        )
-        history_poses = torch.cat(
-            [past_positions, past_yaws.unsqueeze(-1)],
-            dim=-1,
-        )  # [B, T_hist, 3]
-        T_hist = history_poses.shape[1]
+            )
+            start_pose = torch.zeros(bs, 3, device=device)
+        else:
+            past_positions = (
+                data["past_positions"]
+                .to(
+                    device=device,
+                    non_blocking=True,
+                )[:, : self._num_history_poses, :2]
+                .float()
+            )
+            past_yaws = (
+                data["past_yaws"]
+                .to(
+                    device=device,
+                    non_blocking=True,
+                )[:, : self._num_history_poses]
+                .float()
+            )
+            history_poses = torch.cat(
+                [past_positions, past_yaws.unsqueeze(-1)],
+                dim=-1,
+            )  # [B, T_hist, 3]
+            T_hist = history_poses.shape[1]
 
-        history_deltas = self.kdisks_model._compute_deltas(history_poses)
-        kinematic_tokens = self.kdisks_model.encode(history_deltas).view(
-            bs,
-            T_hist - 1,
-        )
+            history_deltas = self.kdisks_model._compute_deltas(history_poses)
+            kinematic_tokens = self.kdisks_model.encode(history_deltas).view(
+                bs,
+                T_hist - 1,
+            )
+            start_pose = history_poses[:, -1]
 
         # ----------------------------------------------------------------------
         # 3. Future tokenization for teacher forcing (training only)
@@ -619,16 +728,21 @@ class AdaptDecoder(nn.Module):
             )  # [B, T_future, 3]
             T_future = target_trajectory.shape[1]
 
-            last_history_pose = history_poses[:, -1:, :]
-            full_future_seq = torch.cat(
-                [last_history_pose, target_trajectory],
-                dim=1,
-            )  # [B, T_future+1, 3]
-            future_deltas = self.kdisks_model._compute_deltas(full_future_seq)
-            future_token_ids = self.kdisks_model.encode(future_deltas).view(
-                bs,
-                T_future,
-            )
+            if self.rolling_tokenization:
+                future_token_ids, future_deltas = self._rolling_tokens(
+                    start_pose,
+                    target_trajectory,
+                )
+            else:
+                full_future_seq = torch.cat(
+                    [start_pose.unsqueeze(1), target_trajectory],
+                    dim=1,
+                )  # [B, T_future+1, 3]
+                future_deltas = self.kdisks_model._compute_deltas(full_future_seq)
+                future_token_ids = self.kdisks_model.encode(future_deltas).view(
+                    bs,
+                    T_future,
+                )
 
             if self.config.use_kdisks:
                 centroids = self.kdisks_model.codebook.centroids
@@ -636,8 +750,11 @@ class AdaptDecoder(nn.Module):
         # ----------------------------------------------------------------------
         # 4. Build encoder context: BEV/status tokens + history pose embeddings
         # ----------------------------------------------------------------------
-        history_pose_emb = self.history_pose_proj(history_poses)  # [B, T_hist, D]
-        encoder_context = torch.cat([context_tokens, history_pose_emb], dim=1)
+        if self.history_free:
+            encoder_context = context_tokens
+        else:
+            history_pose_emb = self.history_pose_proj(history_poses)  # [B, T_hist, D]
+            encoder_context = torch.cat([context_tokens, history_pose_emb], dim=1)
         context_len = encoder_context.shape[1]
         pos_ids = torch.arange(context_len, device=device).unsqueeze(0)
         encoder_context = encoder_context + self.encoder_context_pos_embedding(
@@ -766,7 +883,7 @@ class AdaptDecoder(nn.Module):
                     else output_logits.argmax(dim=-1)
                 )
                 deltas = self.kdisks_model.decode(tokens).float()
-            trajectory = integrate_body_frame_deltas(deltas, history_poses[:, -1])
+            trajectory = integrate_body_frame_deltas(deltas, start_pose)
         else:
             concat_hidden = future_hidden_states.reshape(bs, -1)
             trajectory_flat = self._trajectory_head(concat_hidden)

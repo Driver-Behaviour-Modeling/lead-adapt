@@ -92,7 +92,11 @@ with prepared_training_batches(loader, config) as batches, torch.inference_mode(
     for data in batches:
         with torch.amp.autocast("cuda", dtype=config.torch_float_type, enabled=config.use_mixed_precision_training):
             gt = data["future_waypoints"][:, : config.num_way_points_prediction, :2].float().cuda()
-            start = torch.cat([data["past_positions"][:, -1, :2], data["past_yaws"][:, -1:]], dim=-1).float().cuda()
+            # The future starts where the model starts it: the ego origin when history-free.
+            if decoder.history_free:
+                start = torch.zeros(len(gt), 3, device=gt.device)
+            else:
+                start = torch.cat([data["past_positions"][:, -1, :2], data["past_yaws"][:, -1:]], dim=-1).float().cuda()
 
             # Teacher forcing: the decoder takes its true-prefix path while all
             # submodules (dropout, BatchNorm) stay in eval mode.

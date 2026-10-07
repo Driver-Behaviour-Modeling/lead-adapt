@@ -739,6 +739,19 @@ class TrainingConfig(BaseConfig):
     # Produce pred_future_waypoints/pred_headings by integrating the argmax AR
     # token rollout instead of the trajectory MLP (whose losses are disabled).
     adapt_waypoints_from_tokens = False
+    # Condition the AR decoder on scene and current state only: a learned start
+    # token replaces the history tokens, history poses leave the encoder context,
+    # and the future starts at the ego origin. Under sensor perturbation the
+    # origin is the virtual car, so the targets lead back to the expert path.
+    adapt_history_free = False
+    # Tokenize the future as the sequence of codebook steps whose reconstruction
+    # is closest to the ground-truth poses (beam search over code sequences), so
+    # quantization error does not accumulate and an offset start is corrected
+    # over several feasible steps.
+    adapt_rolling_tokenization = False
+    # Beam width of that search; 1 is a step-by-step greedy match, which never
+    # turns back towards the path from an offset start.
+    adapt_rolling_beam_width = 32
     # How the AR token rollout is decoded at inference (training is unaffected):
     # "greedy" feeds back the argmax token each step; "beam" returns the most
     # likely future token sequence found by beam search; "expected" runs the
