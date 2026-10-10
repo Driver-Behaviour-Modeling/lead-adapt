@@ -566,7 +566,10 @@ class AdaptDecoder(nn.Module):
                     ],
                     dim=2,
                 )
-            best = tokens[:, 0]  # topk is sorted, so beam 0 has the lowest cost
+            best = tokens[
+                :,
+                0,
+            ].contiguous()  # topk is sorted: beam 0 has the lowest cost
             reconstructed = integrate_body_frame_deltas(centroids[best], start_pose)
             previous = torch.cat(
                 [start_pose.unsqueeze(1), reconstructed[:, :-1]],

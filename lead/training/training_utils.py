@@ -120,11 +120,6 @@ def initialize_torch(config: TrainingConfig) -> int:
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.allow_tf32 = True
-    # The cuDNN attention backend (default-on in torch 2.5.0, off from 2.5.1)
-    # returns non-finite gradients from the ADAPT decoder's bf16 attention
-    # backward on ~15% of batches; the same batches are finite with the
-    # flash/efficient/math backends. Every skipped step was this.
-    torch.backends.cuda.enable_cudnn_sdp(False)
     return num_workers
 
 

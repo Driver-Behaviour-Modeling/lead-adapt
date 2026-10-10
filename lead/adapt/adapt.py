@@ -32,6 +32,13 @@ class TFv6(nn.Module):
         self.device = device
         self.config = config
         self.log = {}
+        # The cuDNN attention backend (default-on in torch 2.5.0, off from 2.5.1)
+        # returns non-finite values from the ADAPT decoder's bf16 attention: in
+        # the backward on ~15% of training batches, and in the forward for short
+        # sequences (history-free rollouts: ~5% NaN logits). Flash, efficient and
+        # math backends are finite on the same inputs. Disabled here so training,
+        # analysis scripts and the driving agent all get it.
+        torch.backends.cuda.enable_cudnn_sdp(False)
 
         self.backbone = TransfuserBackbone(self.device, self.config)
 
