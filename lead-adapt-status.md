@@ -1,6 +1,6 @@
 # lead-adapt status
 
-State of the ADAPT reference model in `lead-adapt`: what it is, what has been tried, and what is running. The model is the reference distribution for the unruliness surprisal (`analysis/unruliness.tex`). Last updated **2026-10-08**. The previous, chronologically appended version of this file is in git history (commit `36c947a`).
+State of the ADAPT reference model in `lead-adapt`: what it is, what has been tried, and what is running. The model is the reference distribution for the unruliness surprisal (`analysis/unruliness.tex`). Last updated **2026-10-11**. The previous, chronologically appended version of this file is in git history (commit `36c947a`).
 
 ## Summary
 
@@ -15,12 +15,9 @@ State of the ADAPT reference model in `lead-adapt`: what it is, what has been tr
   - Condition on scene + current state only.
   - Use LEAD's sensor perturbation as recovery labels.
   - If the AR chain still compounds, move to one token = one whole 2 s trajectory (VADv2-style), keeping a discrete distribution.
-- **Running:** `adapt_fresh_histfree_v1` (history-free AR decoder), epoch 9 of 30 done.
-  - At epoch 9, the rollout error at 2 s is 13% lower than the fresh run at the same epoch (0.88 vs 1.01 m).
-  - It still compounds strongly.
-- **Bug found today:** PyTorch 2.5.0's cuDNN attention also produces **NaN logits at inference** for short decoder sequences (history-free rollouts: ~5% NaN, read as "stop").
-  - Fixed in the model constructor (uncommitted). It now covers training, analysis and the driving agent.
-  - D151 must pull it before evaluating any history-free checkpoint.
+- **The history-free decoder fixed token driving:** `adapt_fresh_histfree_v1` e26 drives from its token rollout (beam 8) at **87.3 DS** (217/220 routes), against 53.1 for the fresh run and 70.3 for `full_v1`, on par with the route heads. Why it works (history removal vs rolling tokenization vs recovery labels) is not isolated yet.
+- **Bug fixed 2026-10-08:** PyTorch 2.5.0's cuDNN attention also produces **NaN logits at inference** for short decoder sequences (history-free rollouts: ~5% NaN, read as "stop"). Fixed in the model constructor, so it covers training, analysis and the driving agent.
+- **Next: calibration of the score** on normative driving, in stages: training frames, then unseen LEAD-expert drives on the 220 Bench2Drive routes, then BADCAR (see "Calibration plan").
 
 ## Ongoing experiments
 
@@ -54,6 +51,42 @@ State of the ADAPT reference model in `lead-adapt`: what it is, what has been tr
 - **The quantization floor nearly vanishes** with sequence tokenization (0.10 → 0.02 m at 2 s).
 - **Not comparable across runs:** token accuracy and NLL, because the targets are defined differently.
 - **The rollout still compounds** (0.055 → 0.88 m), as predicted: the 8-step chain inside each plan is still autoregressive. Judge the final epoch before concluding.
+
+### History-free epoch 26, closed loop: final beam result (D151, 2026-10-11)
+
+**`histfree_e26_beam`, full run** (token rollout drives; waypoint mode, beam 8): 217/220 routes, **DS 86.1 official / 87.3 on evaluated routes**, SR 67.7%, RC 93.5, penalty 0.94.
+- Infractions: layout 1, vehicle 19, pedestrian 5, outside lanes 6, route deviation 17, red light 4, blocked 10, TickRuntime 7.
+- Versus the token-driving runs: fresh e27 51.4 / 53.1, `full_v1` 70.0 / 70.3.
+- Versus navcond's MLP waypoints: 84.5 / 84.9.
+- Versus route heads: fresh 88.2, `full_v1` 88.8.
+- **The token distribution now drives within ~1–2 DS of LEAD-style route control.**
+
+`histfree_e26_route`: only 54/220 routes produced results (86.6 on those). The other 166 failed with CARLA's `LowLevelFatalError` (an Unreal Engine crash, not the model). Not rerun.
+
+**Decision (2026-10-11): route-mode evals are no longer a priority.** The paper's model is the token distribution, and it drives on its own (waypoint mode, beam). Route mode is only a reference.
+
+Provisional notes from the partial run:
+
+`histfree_e26_beam`: **the token distribution drives** (waypoint mode for steer, throttle and brake; beam 8; settings verified in the evaluator processes). After **135 of 220 routes**:
+- **mean DS 89.4**, RC 94.5;
+- 119 completed, 6 route deviations, 4 blocked, 6 TickRuntime;
+- infractions: layout 1, vehicle 11, outside lanes 4, route_dev 11, blocked 4.
+
+For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navcond MLP waypoints 84.9; route heads 88.2–88.9.
+- If it holds over all 220 routes, history-free conditioning + LEAD recovery labels close the token-driving gap entirely.
+- Open-loop error at 2 s (epoch 9: 0.88 m) overstated the closed-loop harm: the car re-plans every 0.25 s, and the recovery labels teach correction.
+- **Same-route check** (the 136 routes finished; DS of earlier runs on exactly these routes vs histfree's 89.5):
+
+| Run on the same routes | DS | Mode |
+|---|---|---|
+| fresh e27 | 56.3 | token rollout, beam |
+| `full_v1` | 75.1 / 74.4 | token rollout, beam / expected |
+| navcond | 85.3 | MLP waypoints |
+| fresh e27 | 90.9 | route heads |
+| `full_v1` | 89.5 | route heads |
+
+- So the subset is slightly easier than the full 220 (+2–4 DS for every run), but the ranking holds. **Token driving: +33 over fresh, +14 over `full_v1`, +4 over navcond's MLP, and on par with the route heads.**
+- Still provisional until all 220 routes finish. `histfree_e26_route` is queued next.
 
 ### D151 (ADAPT machine) closed-loop evals, queued by the user
 
@@ -144,11 +177,83 @@ State of the ADAPT reference model in `lead-adapt`: what it is, what has been tr
 5. **Step and window scores are both hypotheses;** keep whichever works.
 6. **Waypoint mode (the token distribution drives) is the test of "the distribution itself drives competently".** Route-mode scores only show that the shared context is good.
 
+## Calibration plan (2026-10-11)
+
+**Goal.** Before scoring anomalies, show that on normative driving the excess surprisal s = ℓ − H is centred and correctly scaled. Every check below is computed by `scripts/score_surprisal.py` on whole drives, frame by frame (4 Hz, so one token = one frame step), under the history-free checkpoint.
+
+**What the script computes.**
+- **Step score:** the first token given scene + current state: ℓ, H, varentropy ν², s, z = s/ν.
+- **Window score:** the whole 2 s token sequence. ℓ comes from teacher forcing; H and ν² from 32 ancestral samples per frame.
+- **Summaries:** split by speed bin, entropy decile and scenario type. Per-frame values are saved to `outputs/surprisal/<name>.npz`.
+
+| Check | A calibrated reference gives | A failure means |
+|---|---|---|
+| mean s: overall, per speed bin, per entropy decile, per scenario | ≈ 0 everywhere | > 0: the model is overconfident or wrong there, so normal driving looks unruly. < 0: it is too diffuse, which forgives anomalies |
+| Var s ÷ mean ν² (and std z) | ≈ 1 | the z scale (and any per-step threshold) is off |
+| slope of s on H (ℓ on H) | ≈ 0 (≈ 1) | the bias grows with uncertainty |
+| drive-level Z = S/√V across drives | mean 0, std 1, \|Z\| > 2 for ≈ 5% | a drive-level flag would fire on normal drives |
+| lag-1 autocorrelation of s within a drive | ≈ 0 | steps are not a martingale, so Z's variance is understated |
+| coverage P(m < α), m = probability mass of codes more likely than the observed one | ≈ α | predictive sets are too narrow (< α) or too wide |
+| top-1 ECE | small | top-1 confidence is miscalibrated |
+| R² of H on speed and \|yaw rate\| while moving | well below 1 | the entropy is just kinematics and the scene adds nothing |
+| first-step quantization residual | ≈ 0 | tokens don't describe the motion (rolling tokens should be exact) |
+
+- **Drive Z is the strictest test.** A per-step bias b shifts Z by about b·√N/ν, so b = 0.08 nats over a 140-step drive already gives Z ≈ 1.
+- **The fix for a small uniform bias** is the per-step allowance η from `unruliness.tex`, fitted on held-out normal drives. It is not a retraining.
+
+**Stages.**
+
+0. **Training frames** (this machine; `--num_routes 200`, about 21k frames). Sanity check only: a model that fails here is miscalibrated in-sample.
+   - **Result, `histfree_e29`, 200 random training routes (21,080 frames; `outputs/surprisal/stage0_histfree_e29_train200.*`):**
+
+     | Check | Step score | Window score (2 s) |
+     |---|---|---|
+     | mean s | **+0.035** (ℓ 1.258, H 1.223; perplexity 3.5) | −0.047 (ℓ 10.09, H 10.14) |
+     | Var s ÷ mean ν² | 1.15 (std z 1.04) | 1.10 |
+     | mean s by speed: stopped / 0.1–5 / 5–10 / > 10 m/s | 0.000 / +0.03 / +0.05 / +0.10 | +0.18 / −0.25 / −0.13 / −0.01 |
+     | mean s by entropy decile | −0.01 … +0.12 (deciles 2–6) … −0.11 (top) | +0.2 (low H) … −1.05 (top) |
+     | slope s on H | −0.03 | |
+     | randomized-PIT coverage at α 0.5 / 0.8 / 0.9 / 0.95 | **0.505 / 0.796 / 0.897 / 0.946**, PIT deciles flat (0.095–0.103) | |
+     | top-1 accuracy / ECE | 0.58 / 0.018 | |
+     | R² of H on speed and \|yaw rate\| (moving) | 0.22 | |
+     | first-step residual: median / > 2τ | 0.017 / 1.4% | |
+     | drive Z (200 drives, median 84 steps) | **mean +0.37, std 1.44, \|Z\| > 2 for 11.5%** | |
+     | autocorrelation of s at lag 1 / 2 / 4 / 8 | 0.07 / 0.03 / 0.03 / 0.04 | |
+
+   - **Per step, the score is calibrated in-sample:** mean s ≈ 0 across speeds, entropy levels and scenario types (all within ±0.26), the PIT is uniform and ECE is small. The scene, not kinematics, drives the entropy (R² 0.22).
+   - **Per drive, it is not.** Var(S)/E(V) = 2.29, because s has a small autocorrelation that persists to lag 8: some drives are consistently a little more surprising than others. A drive-level flag therefore cannot assume the martingale variance V. It needs an empirical null (a variance factor and η fitted on held-out normal drives) or a block bootstrap. Stage 1 decides whether this is a property of the score or an in-sample artefact.
+   - **The window score** is centred overall but tilts with entropy (−1.05 in the top decile). Its entropy is a 32-sample estimate, so part of that tilt may be estimator noise; check with more samples before reading it.
+   - The coverage check uses the randomized PIT m + U·p(u). Without the randomization it reads 0.74 at α = 0.5, an artefact of peaked discrete distributions.
+1. **Unseen normative drives: the LEAD expert re-run on the 220 Bench2Drive eval routes.**
+   - These routes are not in the training data. There are 63 route-id collisions (16 in the same town), but the start positions differ by kilometres.
+   - **Nothing ready-made fits:**
+     - The fork's `slurm/evaluate_expert.sh` (→ `evaluate_scripts_generator.py --expert`) targets Bench2Drive, but it calls `3rd_party/Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator_local.py`, which does not exist. It also never sets `DATAGEN`, so it would only score the expert, and it needs SLURM.
+     - Upstream LEAD v1.5 (`python -m lead --expert`) writes the py123d format, which this fork does not read.
+   - **New `scripts/collect_expert_b2d.sh <gpu> <routes.txt>`:**
+     - same settings as `scripts/eval_expert.sh`: `leaderboard_autopilot` + `scenario_runner_autopilot`, `DATAGEN=1`, LEAD sensor rig, traffic-manager seed 0;
+     - one CARLA per route with retries, like `eval_b2d_one_gpu.sh`;
+     - writes `data/b2d_expert/data/<Scenario>/<route>/`, a data root the training code reads.
+     - **Not run yet.** Try one route first, check its time and disk use, then split the 220 across both D151 GPUs.
+   - **Scenario coverage:** all 42 Bench2Drive scenario types exist in the autopilot scenario runner. Six have no training folder of that name: `Vanilla*`, `SequentialLaneChange` and `YieldToEmergencyVehicle`. Report them separately as out-of-distribution scenes.
+   - **After collection:**
+     1. Count the clean drives. The bucket builder keeps only drives the expert finished without infractions (minimum-speed and minor lane infractions excepted). Record the expert's DS from `data/b2d_expert/results/`.
+     2. Copy the data root to this machine, or run scoring on D151:
+        ```
+        python scripts/score_surprisal.py --checkpoint_dir outputs/checkpoints/histfree_e29 --data_root data/b2d_expert
+        ```
+        The first call builds `data/b2d_expert/buckets/`.
+     3. Compare with Stage 0. The difference is the generalisation part of the bias.
+     4. Fit η on half of the drives and test drive Z on the other half.
+2. **Optional: a second normative driver.** Think2Drive's Bench2Drive dataset is log-replayable from its annotations, rendered with LEAD's rig. It would test whether a competent but different driving style scores s ≈ 0. A replay script is not written yet.
+3. **BADCAR normal drives (PDM-Lite):** the baseline that anomalies are injected into. Needed for η and the false-alarm rate. Open: whether the sensor rig and rate match LEAD's.
+4. **BADCAR anomalies:** detection AUROC per anomaly type, step vs window score, time to detection.
+
 ## Next steps
 
-1. **Finish `adapt_fresh_histfree_v1`.** Run Step A at epochs 19 and 29, against the fresh run's matching epochs.
-2. **If the rollout gap closes enough:** closed loop on D151 (route mode + waypoint/beam), **after pulling the cuDNN inference fix.**
-3. **If it still compounds (expected), move to the whole-trajectory token:** one categorical over K = 4,096 trajectories, each 2 s.
+1. **Calibration**, as above: read Stage 0, then collect and score Stage 1.
+2. **Ablations, if useful:** history-free without rolling tokenization; rolling tokenization with history. These attribute the 87.3 DS.
+3. **Paper wording:** the scored head now also drives competitively (87.3 DS in waypoint mode), so the claim can be "the distribution that drives is the distribution that scores".
+4. **Fallback only if the score needs it: the whole-trajectory token.** One categorical over K = 4,096 trajectories, each 2 s.
    - **Vocabulary:** k-means over expert 2 s windows.
      - Held-out nearest-template error at 2 s (moving windows): 0.24 m. For comparison, K = 8,192 gives 0.21 m, and VADv2-style farthest-point sampling 0.43 m.
    - **Head:** logit_k = q(c_t) · E(template_k); hard CE to the nearest template, in the virtual-car frame.
@@ -157,8 +262,6 @@ State of the ADAPT reference model in `lead-adapt`: what it is, what has been tr
      - window score: exact;
      - step score: via the first-step marginal, or a small first-step head on the 1,234-code vocabulary.
    - **Precedent:** VADv2 (ICLR 2026) uses exactly this, with hard CE and argmax driving, and reaches 76.2 DS on Bench2Drive.
-4. **Ablations, if useful:** history-free without rolling tokenization; rolling tokenization with history.
-5. **Paper wording:** in the default configuration the scored head is not the one that drives. State the claim as "a token distribution trained on normative driving" unless waypoint mode becomes competitive.
 
 ## Literature consulted (2026-10-07)
 
@@ -190,6 +293,8 @@ State of the ADAPT reference model in `lead-adapt`: what it is, what has been tr
 | Stability | `grad_clip_norm`, non-finite-step guard, `keep_all_epoch_checkpoints`, cuDNN attention disabled in the model constructor | `train.py`, `lead/adapt/adapt.py` |
 | Open-loop analysis (Step A) | per-horizon error for the GT-token floor, teacher forcing, each decoding and a reference checkpoint; token accuracy and NLL | `scripts/eval_open_loop_rollout.py` |
 | Launch script | `scripts/posttrain_token_decoder.sh` (+ `RUN_NAME`, `EXTRA_CONFIG`) | |
+| Surprisal calibration | step and window excess surprisal over whole drives, with the calibration checks of the plan; `--data_root` scores any CARLA data root | `scripts/score_surprisal.py` |
+| Expert collection on benchmark routes | LEAD expert with `DATAGEN=1`, one CARLA per route with retries, local (no SLURM) | `scripts/collect_expert_b2d.sh` |
 
 **Uncommitted (2026-10-08):**
 - the cuDNN disable has moved to `lead/adapt/adapt.py`;
