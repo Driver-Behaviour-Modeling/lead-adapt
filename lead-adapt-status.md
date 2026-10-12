@@ -226,15 +226,43 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
    - The coverage check uses the randomized PIT m + U·p(u). Without the randomization it reads 0.74 at α = 0.5, an artefact of peaked discrete distributions.
 1. **Unseen normative drives: the LEAD expert re-run on the 220 Bench2Drive eval routes.**
    - These routes are not in the training data. There are 63 route-id collisions (16 in the same town), but the start positions differ by kilometres.
-   - **Nothing ready-made fits:**
-     - The fork's `slurm/evaluate_expert.sh` (→ `evaluate_scripts_generator.py --expert`) targets Bench2Drive, but it calls `3rd_party/Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator_local.py`, which does not exist. It also never sets `DATAGEN`, so it would only score the expert, and it needs SLURM.
-     - Upstream LEAD v1.5 (`python -m lead --expert`) writes the py123d format, which this fork does not read.
-   - **New `scripts/collect_expert_b2d.sh <gpu> <routes.txt>`:**
-     - same settings as `scripts/eval_expert.sh`: `leaderboard_autopilot` + `scenario_runner_autopilot`, `DATAGEN=1`, LEAD sensor rig, traffic-manager seed 0;
+   - **How the paper evaluated the expert.** LEAD paper Table 5: LEAD expert 96.8 DS / 96.6% SR on Bench2Drive (PDM-Lite 97.0 / 92.3).
+     - The path is `slurm/evaluate_expert.sh` (→ `evaluate_scripts_generator.py --expert`, byte-identical to upstream's `cvpr2026` branch). It runs the expert through Bench2Drive's leaderboard via `3rd_party/Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator_local.py`.
+     - That file and its companion `_local` modules were never released, on either upstream branch. Fail2Drive has the full set.
+     - Upstream LEAD v1.5 (`python -m lead --expert`) always uses the autopilot leaderboard and writes the py123d format, which this fork does not read.
+   - **Ported (2026-10-12): Bench2Drive's leaderboard for the privileged expert.** New files in `3rd_party/Bench2Drive/leaderboard/leaderboard/`, each a Bench2Drive base file with Fail2Drive's `_local` changes applied:
+     - `leaderboard_evaluator_local.py`:
+       - builds the expert as `(agent_config, route index)` and calls `setup(route_file, route_date_string, traffic_manager)`;
+       - timestamps route records;
+       - does not append `+save_name` to the agent config (the expert parses it as the route XML);
+       - takes `--resume` as an int.
+       - It keeps the given `--traffic-manager-port`; Fail2Drive scans for a free port from 2000, which can collide with a second CARLA.
+     - `autoagents/agent_wrapper_local.py`: a copy of `leaderboard_autopilot`'s, plus Bench2Drive's `TickRuntimeError`, so every sensor is set up exactly as for the training data. Bench2Drive's own wrapper configures only RGB cameras; depth, semantic and instance cameras would fall back to CARLA defaults.
+     - `autoagents/autonomous_agent_local.py`: the expert's constructor signature, the dense route, `__call__(sensors)`, and the route downsampled every 200 m as in `leaderboard_autopilot` (Bench2Drive: 50 m).
+     - The evaluator also carries upstream v1.5.1's hard exit when an exception escapes `run()` (otherwise watchdog threads hang the process), the data-generation sensor icons, `ROUTE_INDEX` and the route XML path, as in `leaderboard_autopilot`.
+     - `scenarios/scenario_manager_local.py` and `utils/statistics_manager_local.py`: route records carry the date string and are returned to `destroy()`.
+   - **Scenario runner: `scenario_runner_autopilot`, not Bench2Drive's.**
+     - The expert reads the active-scenario registry in `CarlaDataProvider` (`active_scenarios`, `get_current_scenario_memory`, …), unguarded. Only the autopilot runner has it (hooks in 33 scenario files plus 4 core files), so the expert would crash on Bench2Drive's runner.
+     - The autopilot runner is Bench2Drive's runner plus those hooks. Its file sets match, except that `T_Junction` lives in `vanilla_turn.py`.
+     - **Behaviour differences from stock Bench2Drive:** scenario timeouts of 90 s instead of 180 s (600 s in `CutIn`), and the sink distance in `OppositeVehicleTakingPriority` (30 m vs 10 m).
+     - Route criteria come from Bench2Drive's leaderboard: minimum-speed checkpoints 20, agent-blocked limit 60 s.
+     - Matching ≈ 96.8 DS would show these differences don't matter.
+     - **Tested 2026-10-12 on this machine (full H100):** routes 25975 and 25968 (Town07, `VanillaSignalizedTurnEncounterGreenLight`) completed with DS 100, with only a minimum-speed infraction, which is not penalised. The saved folders have the training data's exact layout (37 frames each at 4 Hz).
+   - **`scripts/collect_expert_b2d.sh <gpu> <routes.txt>` uses this evaluator:**
+     - `DATAGEN=1`, LEAD sensor rig, traffic-manager seed 0;
      - one CARLA per route with retries, like `eval_b2d_one_gpu.sh`;
-     - writes `data/b2d_expert/data/<Scenario>/<route>/`, a data root the training code reads.
-     - **Not run yet.** Try one route first, check its time and disk use, then split the 220 across both D151 GPUs.
-   - **Scenario coverage:** all 42 Bench2Drive scenario types exist in the autopilot scenario runner. Six have no training folder of that name: `Vanilla*`, `SequentialLaneChange` and `YieldToEmergencyVehicle`. Report them separately as out-of-distribution scenes.
+     - writes `data/b2d_expert/data/<Scenario>/<route>/` (a data root the training code reads) and `data/b2d_expert/results/<route>.json`.
+     - Expert DS: `EVALUATION_DATASET=bench2drive python3 slurm/evaluation/merge_route_json.py --folder data/b2d_expert/results`.
+     - A route counts as done unless its record is an infrastructure failure (`Failed - …` other than TickRuntime, or route score 0). A plain `Failed` is the expert's driving and is not retried.
+     - `REPETITION=0`, so folders are named `<Town>_Rep0_…` like the training data.
+   - **Where it can run:**
+     - **Not on MIG slices.** MIG instances support no graphics API, and Vulkan does not enumerate the partitioned GPU, so CARLA cannot render there. On this machine Vulkan adapter 0 is the full H100.
+     - **Speed on the full H100:**
+       - Uncapped: 9.1 s simulated took 327 s of wall time. The GPU sat at ~0% most of the time while the expert's Python process used 15–50 cores: numba (`parallel=True`), torch and BLAS each start one thread per core (84 here). SLURM jobs had 2 CPUs, which hid this.
+       - Capped at 4 threads per pool (now the script's default): 154 s for the same route, still DS 100.
+       - At that rate, one instance needs ~20 h for the 220 routes (23 km in total, median 104 m per route), plus ~1 min of boot and load per route.
+       - Each instance takes ~7 GB of GPU memory and a few cores, so several can share the H100. Untested beyond one.
+   - **Scenario coverage:** the routes use 44 scenario types, all present in the autopilot runner. Six (5 routes each, 30 in total) have no training folder of that name: `VanillaNonSignalizedTurn`, `VanillaNonSignalizedTurnEncounterStopsign`, `VanillaSignalizedTurnEncounterGreenLight`, `VanillaSignalizedTurnEncounterRedLight`, `SequentialLaneChange` and `YieldToEmergencyVehicle`. Report them separately as out-of-distribution scenes.
    - **After collection:**
      1. Count the clean drives. The bucket builder keeps only drives the expert finished without infractions (minimum-speed and minor lane infractions excepted). Record the expert's DS from `data/b2d_expert/results/`.
      2. Copy the data root to this machine, or run scoring on D151:

@@ -1,12 +1,22 @@
 #!/usr/bin/bash
-# Re-run the LEAD expert (DATAGEN=1, LEAD sensor rig) on benchmark routes, e.g. the
-# 220 Bench2Drive eval routes, to get unseen normative drives for scoring.
+# Re-run the LEAD expert (DATAGEN=1, LEAD sensor rig) on the 220 Bench2Drive eval
+# routes, to get unseen normative drives for scoring and the expert's Bench2Drive DS
+# (LEAD paper Table 5: 96.8 DS / 96.6% SR).
 # One CARLA per route with retries, like eval_b2d_one_gpu.sh; two of these can run
 # side by side, one per GPU, on halves of the route list.
+#
+# Leaderboard: Bench2Drive's, through leaderboard_evaluator_local.py (the privileged-
+# agent evaluator ported from fail2drive; upstream never released it), so routes are
+# scored with Bench2Drive's criteria. Scenarios: scenario_runner_autopilot, which is
+# Bench2Drive's scenario runner plus the hooks the expert reads (active scenarios and
+# their actors). It differs from Bench2Drive's runner in scenario timeouts (90 s vs
+# 180 s) and one sink distance in OppositeVehicleTakingPriority.
 #
 # Usage:
 #   collect_expert_b2d.sh <gpu_index> <routes_list_file>
 #   ls $PWD/data/benchmark_routes/bench2drive/*.xml > routes.txt   # all 220
+#   # expert DS afterwards (Bench2Drive's /220 formula):
+#   EVALUATION_DATASET=bench2drive python3 slurm/evaluation/merge_route_json.py --folder data/b2d_expert/results
 #
 # Output (a carla_root the training code and scripts/score_surprisal.py read):
 #   $OUT/data/<ScenarioType>/<Town>_Rep0_<route>/   frames, metas, results.json
@@ -16,6 +26,8 @@
 # Env knobs:
 #   OUT=data/b2d_expert   MAX_ATTEMPTS=3   ROUTE_WALLCLOCK=1800   CARLA_BOOT_TIMEOUT=240
 #   GPU_ADAPTERS="0 2"    logical GPU -> Vulkan -graphicsadapter map
+#   ADAPTER=0             Vulkan adapter directly, when <gpu> is a UUID. On the H100 box
+#                         MIG slices are invisible to Vulkan; adapter 0 is the full H100.
 #   TM_SEED=0             traffic-manager seed (the B2D evals use 0)
 
 set -u
@@ -29,10 +41,15 @@ eval "$(conda shell.bash hook)"
 conda activate "${CONDA_INTERPRETER:-lead}"
 
 export CARLA_ROOT="${CARLA_ROOT:-$LEAD_PROJECT_ROOT/3rd_party/CARLA_0915}"
-export PYTHONPATH="3rd_party/leaderboard_autopilot:3rd_party/scenario_runner_autopilot:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
+export PYTHONPATH="3rd_party/Bench2Drive/leaderboard:3rd_party/scenario_runner_autopilot:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
 export SCENARIO_RUNNER_ROOT=3rd_party/scenario_runner_autopilot
-export LEADERBOARD_ROOT=3rd_party/leaderboard_autopilot
-export DEBUG_CHALLENGE=0 DATAGEN=1 PYTHONUNBUFFERED=1
+export LEADERBOARD_ROOT=3rd_party/Bench2Drive/leaderboard
+EVALUATOR=3rd_party/Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator_local.py
+export DEBUG_CHALLENGE=0 DATAGEN=1 REPETITION=0 PYTHONUNBUFFERED=1
+# The expert's numba/torch/BLAS pools default to one thread per core; on a large box
+# (84 cores) they contend and a route runs 2x slower than with 4 threads each.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}" NUMBA_NUM_THREADS="${NUMBA_NUM_THREADS:-4}"
 
 OUT="${OUT:-$LEAD_PROJECT_ROOT/data/b2d_expert}"
 mkdir -p "$OUT/data" "$OUT/results" "$OUT/logs" "$OUT/staging"
@@ -42,7 +59,7 @@ ROUTE_WALLCLOCK="${ROUTE_WALLCLOCK:-1800}"
 CARLA_BOOT_TIMEOUT="${CARLA_BOOT_TIMEOUT:-240}"
 TM_SEED="${TM_SEED:-0}"
 GPU_ADAPTERS="${GPU_ADAPTERS:-0 2}"
-ADAPTER=$(echo "$GPU_ADAPTERS" | awk -v i="$GPU" '{print $(i+1)}')
+ADAPTER="${ADAPTER:-$(echo "$GPU_ADAPTERS" | awk -v i="$GPU" '{print $(i+1)}')}"
 
 echo "GPU $GPU (vk adapter $ADAPTER) | routes: $(wc -l < "$LIST") | out: $OUT"
 
@@ -57,7 +74,17 @@ wait_for_carla() {  # returns 0 only when a real TCP connect succeeds
     return 1
 }
 
-json_ok() { python3 -c "import json,sys;d=json.load(open('$1'));sys.exit(0 if d['_checkpoint']['records'] else 1)" 2>/dev/null; }
+# A route is done when its record shows the drive ran: "Completed"/"Perfect", or "Failed"
+# from driving (blocked, timed out) or a too-slow tick. "Failed - ..." records (agent not
+# set up, agent or simulation crashed) and zero route scores are infrastructure crashes
+# and are retried. (Upstream's scripts/slurm/evaluate_policy.py also retries a plain
+# "Failed"; an expert blocked once would usually be blocked again.)
+json_ok() { python3 -c "
+import json, sys
+records = json.load(open('$1'))['_checkpoint']['records']
+crashed = [r for r in records if r['status'] != 'Failed - TickRuntime'
+           and (r['status'].startswith('Failed - ') or r['scores']['score_route'] < 1e-11)]
+sys.exit(0 if records and not crashed else 1)" 2>/dev/null; }
 
 kill_carla_on_port() {  # the engine is reparented to init, so kill it by its port
     local port=$1 pids
@@ -81,11 +108,11 @@ run_attempt() {
         # A failed attempt leaves a half-written route folder: start every attempt clean.
         rm -rf "$OUT/staging/$route_id" "$ckpt_json"
         SAVE_PATH="$OUT/staging/$route_id" TEAM_CONFIG="$route_file" \
-        CUDA_VISIBLE_DEVICES=$GPU timeout -k 30 "$ROUTE_WALLCLOCK" python3 -u \
-            3rd_party/leaderboard_autopilot/leaderboard/leaderboard_evaluator_local.py \
+        CUDA_VISIBLE_DEVICES=$GPU timeout -k 30 "$ROUTE_WALLCLOCK" python3 -u "$EVALUATOR" \
             --routes="$route_file" --repetitions=1 --track=MAP --checkpoint="$ckpt_json" \
+            --debug-checkpoint="$OUT/results/debug_${route_id}.txt" \
             --agent=lead/expert/expert.py --agent-config="$route_file" \
-            --debug=0 --resume=0 --timeout=600 \
+            --debug=0 --record= --resume=0 --timeout=600 \
             --port="$port" --traffic-manager-port="$tm_port" --traffic-manager-seed="$TM_SEED"
         rc=$?
         [ $rc -eq 124 ] && echo "!!! $route_id hit ${ROUTE_WALLCLOCK}s wallclock"
