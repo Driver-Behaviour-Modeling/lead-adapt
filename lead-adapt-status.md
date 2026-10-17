@@ -1,23 +1,114 @@
 # lead-adapt status
 
-State of the ADAPT reference model in `lead-adapt`: what it is, what has been tried, and what is running. The model is the reference distribution for the unruliness surprisal (`analysis/unruliness.tex`). Last updated **2026-10-11**. The previous, chronologically appended version of this file is in git history (commit `36c947a`).
+State of the ADAPT reference model in `lead-adapt`: what it is, what has been tried, and what is running. The model is the reference distribution for the unruliness surprisal (`analysis/unruliness.tex`). Last updated **2026-10-17**. The previous, chronologically appended version of this file is in git history (commit `36c947a`).
 
 ## Summary
 
-- **Model.** LEAD (TransFuser v6) perception and context. Its planning decoder is replaced by route + target-speed query heads (these drive by default) plus an autoregressive (AR) head over a 1,234-code motion vocabulary. The AR head is the scoring density, and it also drives in waypoint mode.
-- **Route-mode driving matches the earlier chain.** Bench2Drive-220: `full_v1` 88.8 DS, fresh post-train 88.2 DS (75.5% success, 0 route deviations).
-- **The token distribution drives poorly on its own.** Best is `full_v1` at 70–71 DS in waypoint mode, against 84.9 for the old MLP waypoints. The fresh post-train manages only 53 DS.
-- **Cause: exposure bias in the 8-step chain.** Open loop, teacher-forced and rollout errors agree at 0.25 s, then diverge (fresh: 0.21 m vs 0.80 m at 2 s).
-- **Remedies tried so far:**
-  - better decoding (beam, expected): +3–4 DS;
-  - short scheduled-sampling fine-tunes: no gain, and scheduled sampling alone degrades the density.
-- **Current direction (agreed 2026-10-07):** the score does not need token-by-token history.
-  - Condition on scene + current state only.
-  - Use LEAD's sensor perturbation as recovery labels.
-  - If the AR chain still compounds, move to one token = one whole 2 s trajectory (VADv2-style), keeping a discrete distribution.
-- **The history-free decoder fixed token driving:** `adapt_fresh_histfree_v1` e26 drives from its token rollout (beam 8) at **87.3 DS** (217/220 routes), against 53.1 for the fresh run and 70.3 for `full_v1`, on par with the route heads. Why it works (history removal vs rolling tokenization vs recovery labels) is not isolated yet.
-- **Bug fixed 2026-10-08:** PyTorch 2.5.0's cuDNN attention also produces **NaN logits at inference** for short decoder sequences (history-free rollouts: ~5% NaN, read as "stop"). Fixed in the model constructor, so it covers training, analysis and the driving agent.
-- **Next: calibration of the score** on normative driving, in stages: training frames, then unseen LEAD-expert drives on the 220 Bench2Drive routes, then BADCAR (see "Calibration plan").
+- **Model.** LEAD (TransFuser v6) perception and context, with an autoregressive (AR) head over a 1,234-code motion vocabulary. The AR head is both the scoring density and, in waypoint mode, the driver.
+- **Token driving works since the history-free decoder:** `adapt_fresh_histfree_v1` e26 drives from its token rollout (beam 8) at **87.3 DS** (217/220 routes), on par with the route heads; e19 at 84.1 DS.
+- **The step score is calibrated in-sample but not on unseen drives.** On the LEAD expert's re-run of the Bench2Drive routes (Stage 1), mean s is +0.16 to +0.47 per step, with a heavy tail, growing with training epochs.
+- **One temperature (T ≈ 1.25–1.5), fitted on half the drives, fixes the per-step bias on the other half.** It does not fix drive-level Z: the score has memory, with lag-1 autocorrelation of about 0.3.
+- **Synthetic single-step anomalies:** swerves are detected (≈ 85% at 1% false alarms); brakes and speed-ups are weak (9–16%).
+- **Next:** a drive-level null, sustained-anomaly tests, scoring e26 with temperature, then BADCAR. See "Next steps, and why".
+- The reasoning behind all of this, with the math, is in "Everything so far, with the reasoning" below. The detailed numbers are in "Calibration plan".
+
+## Everything so far, with the reasoning
+
+### 1. Goal
+
+The paper proposes a way to score how unruly a driver is, by comparing what they did with a reference model of normal driving. A driver who keeps doing things the reference finds surprising, beyond what the situation already makes uncertain, is unruly. The test bed is BADCAR: the PDM-Lite expert with injected rule-based anomalies. The contribution is the scoring method, not the driving model.
+
+### 2. The reference model
+
+- **Architecture:** LEAD (TransFuser v6) fuses cameras, LiDAR and radar into a scene representation c_t. The ADAPT head on top predicts motion as tokens.
+- **A token** is one 0.25 s motion step in the car's own frame, (Δx, Δy, Δheading). There are 1,234 of them, from k-disks clustering of expert motion (radius τ = 0.05; heading weighted by the car's half-length, 2.672).
+- **The head predicts 8 tokens (2 s).** Its softmax over tokens is the reference distribution p(· | c_t).
+- **Three design changes made it work:**
+  1. **History-free conditioning.**
+     - Feeding past motion tokens causes copycat behaviour: the model continues the past instead of reading the scene.
+     - For scoring it is worse: an anomalous driver's own past becomes the condition, so their behaviour starts to look normal.
+     - The model now conditions only on the scene and the current state, through a learned start token.
+  2. **Sequence-level ("rolling") tokenization.** The 8 target tokens are chosen jointly, by beam search, so the reconstructed 2 s path is closest to the real one. Quantization error no longer accumulates: the floor at 2 s drops from 0.10 to 0.02 m. Targets can also lead back to the path after an offset.
+  3. **LEAD's sensor perturbation as recovery labels.** In half the training frames the sensors are virtually shifted (about 0.4 m, 3.5°), and the target is the way back to the expert path. That is DART-style recovery data against exposure bias (small errors compounding when the model drives on its own predictions).
+- **Result:** driving purely from the token distribution reaches 87.3 DS (e26), against 53 for the previous fresh model. The distribution that drives is the one that scores.
+
+### 3. The score: the math
+
+At frame t the model gives p_k = p(k | c_t) over codes, and the driver took u_t.
+
+- **Surprisal:** ℓ_t = −log p(u_t | c_t), in nats.
+- **Entropy:** H_t = −Σ_k p_k log p_k, the expected surprisal under the model.
+- **Excess surprisal, the score:** s_t = ℓ_t − H_t. Subtracting H removes the scene's own uncertainty: in a busy junction even normal driving is surprising.
+- **Key property:** if the driver follows p, then E[ℓ_t | c_t] = Σ_k p_k (−log p_k) = H_t, so **E[s_t | c_t] = 0 in every scene.**
+  - If the driver follows q, then E_q[s] = H(q) + KL(q‖p) − H(p).
+  - For an anomalous driver the KL term makes it positive.
+  - For a normal driver it is nonzero only if the model p is wrong, which the calibration tests check.
+- **Scale:** the varentropy ν²_t = Σ_k p_k (log p_k)² − H_t² is the variance of s_t under the model, so z_t = s_t / ν_t should have mean 0 and standard deviation 1.
+- **Drive level:**
+  - Sum over a drive: S = Σ s_t and V = Σ ν²_t.
+  - If the steps are martingale differences (each s_t has mean 0 given everything before it), the central limit theorem gives Z = S / √V ≈ N(0, 1) across normal drives.
+  - That gives a drive flag: |Z| > 2 for about 5% of normal drives.
+- **Step vs window:**
+  - The step score uses only the first token, so every 0.25 s of driving is scored once, which is what makes the martingale argument work.
+  - The window score scores the whole 2 s jointly. It sees manoeuvre-level anomalies, but consecutive windows overlap 7/8, so they are strongly correlated.
+- **Temperature scaling:** p_T(k) ∝ exp(logit_k / T). With T > 1 every distribution flattens and H rises, while the ranking of codes is unchanged. It is the standard post-hoc fix for overconfidence.
+
+### 4. The calibration tests
+
+On normal drives, a calibrated reference must show:
+- **mean s ≈ 0**, overall and within speed bins, entropy deciles and scenario types;
+- **Var s ÷ mean ν² ≈ 1**;
+- **a uniform randomized PIT.**
+  - m = the probability mass of codes the model ranked above what happened, and π = m + U·p(u), with U ~ Uniform(0, 1).
+  - π is uniform under calibration. U is needed because the distribution is discrete: without it, coverage reads 0.74 at α = 0.5 from peaked distributions alone.
+  - Coverage P(π < α) ≈ α means the model's α-level prediction sets contain the truth α of the time.
+- **small ECE** (top-1 confidence matches top-1 accuracy);
+- **autocorrelation of s ≈ 0**, needed for the martingale;
+- **drive Z ~ N(0, 1).**
+
+`scripts/score_surprisal.py` computes all of them. `analysis/unruliness_calibration.ipynb` plots them, with a glossary.
+
+### 5. Stage 0: training frames
+
+200 training routes, 21k frames. Every per-step check passed: mean s +0.035, uniform PIT, ECE 0.018. Drive Z already failed (std 1.44), because s had a small persistent autocorrelation. Being in-sample, this was always only a sanity check.
+
+### 6. Stage 1 data: the expert on unseen routes
+
+- **Why these drives:** we need normal driving the model never trained on, with the same sensor rig. LEAD's own expert re-run on the 220 Bench2Drive evaluation routes gives exactly that: normal by construction, on routes disjoint from training (same-name collisions start kilometres apart).
+- **Making it run:**
+  - LEAD's paper evaluates its expert on Bench2Drive (96.8 DS), but the evaluator files were never released. They were ported from Fail2Drive into Bench2Drive's leaderboard.
+  - It uses the autopilot scenario runner, which is Bench2Drive's runner plus the hooks the expert reads (without them the expert crashes).
+  - It uses the autopilot sensor wrapper, so sensors match the training data exactly.
+- **On this machine:**
+  - MIG slices cannot render; they support no graphics API.
+  - The expert's math libraries spread over all 84 cores and contended. Capping them at 4 threads halved the time.
+  - Town12 runs at about 6 s per simulator tick with 4 instances. Collection took about 50 h on the full H100.
+- **Result:**
+  - 206 of 220 routes collected. Town11 (7 routes) breaks the expert's map renderer, and 7 more stall deterministically.
+  - The expert scores DS 99.0 on the routes it completed, which matches the paper and validates the port.
+  - 200 routes (16,719 frames) pass the clean-drive filter.
+
+### 7. Stage 1 result: miscalibrated on unseen drives
+
+- With e29: mean s +0.47, Var s ÷ ν² 4.6, coverage at α = 0.9 of 0.83, drive Z +4.5 ± 5.4.
+- The bulk is fine (median s ≈ 0); the problem is a heavy tail. s > 6 nats is 5–9× more common than in-sample, concentrated in InvadingTurn, the interurban flows and SequentialLaneChange.
+- **Training longer makes it worse.** From e9 to e29 the NLL on unseen drives barely moves while the entropy falls: the model grows more confident without growing more accurate on new routes. That is classic overconfidence from fitting the training set. In KL terms, an overconfident p has too small an H(p), which inflates s for every normal driver.
+
+### 8. Temperature scaling and synthetic anomalies
+
+- **Temperature, fitted on half A by NLL and tested on half B:**
+  - At T ≈ 1.25–1.5: mean s ≈ 0 (e19 +0.09, e29 −0.06), coverage about nominal, Var s ÷ ν² ≈ 1–1.3. The per-step miscalibration was mostly global overconfidence.
+  - Drive Z keeps a std of about 3: temperature does not change the autocorrelation of s (0.3–0.37 at lag 1), so V still underestimates the real variance of S.
+- **Synthetic anomalies:** the expert's real next step is replaced, in the same scene, by a −6 m/s² brake, a +4 m/s² speed-up or a 4 m/s² swerve.
+  - Swerves: AUROC 0.97–0.98, about 85% detected at 1% false alarms.
+  - Brakes and speed-ups: AUROC 0.76–0.89, 9–16% detected. One braking step changes the motion by only 0.19 m, which is within normal variation.
+  - Temperature barely changes detection, since it preserves rankings. Later checkpoints detect longitudinal anomalies slightly better.
+
+### 9. Driving vs calibration across epochs
+
+- e19 has the best NLL on unseen drives and is calibrated at T ≈ 1.3. In closed loop it drives at **84.6 DS vs e26's 87.2 on the same 214 routes** (−2.6), with more route deviations (23 vs 17) and blocked routes (13 vs 10).
+- The best-driving checkpoint (e26) is therefore not the best-calibrated one, and e26 has not been scored yet.
+- Because temperature leaves the code ranking unchanged, the natural choice is **e26 for driving and e26 + T for scoring**: the same weights, recalibrated by one scalar. e29 + T = 1.5 (NLL 1.623 vs e19's 1.602) suggests the late checkpoints are nearly as good after scaling.
 
 ## Ongoing experiments
 
@@ -121,8 +212,11 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
 | `full_v1` e4 | token rollout | beam 8 | 219 | 70.3 | 37.7 | 55 / 73 | 41 | 32 | 17 |
 | `full_v1` e4 | token rollout | expected | 220 | 71.3 | 40.5 | 47 / 74 | 38 | 32 | 16 |
 | fresh post-train e27 | token rollout | beam 8 | 213 | 53.1 | 17.3 | 54 / 100 | 69 | 34 | **42** |
+| **histfree e26** | token rollout | beam 8 | 217 | **87.3** | 67.7 | 1 / 19 | 6 | 17 | 10 |
+| histfree e19 (D151 GPU1 only, 2026-10-17) | token rollout | beam 8 | 217 | 84.1 | 63.6 | 2 / 18 | 4 | 23 | 13 |
 
 - **Waypoint-mode controller:** the old TransFuser waypoint controller. It costs only ~4 DS (navcond 88.9 → 84.9), so it is not the main reason the token rollout is weak.
+- **e19 vs e26 on the 214 routes both completed:** 84.6 vs 87.2 DS. e19 also has 7 pedestrian collisions (vs 5) and 6 red lights (vs 4).
 - **Noise:** each scenario type has 5 routes, so per-scenario numbers are noisy. Expect about ±1–2 DS run to run.
 - **Fresh's 0 route deviations:** its route/speed heads and navigation conditioning were trained from scratch on the corrected history window. Not isolated by an ablation.
 - **Fresh's many blocked routes in token mode:** suspected collapse onto the stationary token when its own prefix drifts. Not verified.
@@ -262,6 +356,66 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
        - Capped at 4 threads per pool (now the script's default): 154 s for the same route, still DS 100.
        - At that rate, one instance needs ~20 h for the 220 routes (23 km in total, median 104 m per route), plus ~1 min of boot and load per route.
        - Each instance takes ~7 GB of GPU memory and a few cores, so several can share the H100. Untested beyond one.
+   - **Collection finished 2026-10-15 (on this machine's full H100, 4 parallel instances, ~50 h):**
+     - 206 of 220 routes collected (4.0 GB). Expert DS 99.0 on the 203 completed routes, with 197 clean; DS 91.3 over all 220.
+     - Not collectable (14): Town11 (7; HD-map renderer), all 5 `YieldToEmergencyVehicle` routes and 2 Town06 routes (deterministic "A sensor took too long to send their data").
+     - 3 routes ended "Failed - TickRuntime", and the clean-drive filter drops 6, leaving **200 routes / 16,719 frames** to score.
+   - **Full Stage 1 result (2026-10-15)**, `outputs/surprisal/stage1_full_histfree_e{9,19,29}.*`:
+
+     | | Stage 0 (training, e29) | Stage 1 e9 | Stage 1 e19 | Stage 1 e29 |
+     |---|---|---|---|---|
+     | mean s (step) / median s | +0.035 / −0.07 | **+0.16** / −0.13 | +0.37 / −0.05 | +0.47 / −0.04 |
+     | Var s ÷ mean ν² | 1.15 | 2.2 | 3.8 | 4.6 |
+     | mean ℓ / mean H | 1.26 / 1.22 | 1.81 / 1.65 | **1.68** / 1.31 | 1.73 / 1.26 |
+     | P(s > 6) / 99th percentile of s | 0.003 / 4.3 | 0.014 / 7.1 | 0.022 / 8.7 | 0.026 / 9.8 |
+     | randomized-PIT coverage at α 0.5 / 0.9 / 0.95 | 0.51 / 0.90 / 0.95 | 0.52 / 0.88 / 0.93 | 0.47 / 0.85 / 0.90 | 0.45 / 0.83 / 0.89 |
+     | top-1 accuracy / ECE | 0.58 / 0.018 | 0.52 / 0.032 | 0.55 / 0.028 | 0.55 / 0.044 |
+     | drive Z: mean / std / share with \|Z\| > 2 | +0.37 / 1.44 / 12% | +1.75 / 3.63 / 39% | +3.61 / 4.58 / 57% | +4.53 / 5.42 / 67% |
+     | lag-1 autocorrelation of s | 0.07 | 0.32 | 0.35 | 0.38 |
+     | window mean s | −0.05 | +0.69 | +3.6 | +5.3 |
+
+     - **This confirms the partial result.** On unseen normative drives every checkpoint is overconfident in the tail, and more so with training. Epoch 19 has the best held-out NLL, but epoch 9 is the best calibrated, because H falls faster than ℓ improves.
+     - **Worst scenario types (e9):** InvadingTurn +1.84, InterurbanAdvancedActorFlow +1.46, SequentialLaneChange +1.21 (no training folder), InterurbanActorFlow +1.06, MergerIntoSlowTraffic +0.87.
+     - **The score has memory** (lag-1 autocorrelation 0.3; still about 0.05 at 4 s). The martingale variance V understates Var S, so drive-level flags need an empirical null.
+     - Inspection notebook: `analysis/unruliness_calibration.ipynb`, which picks up every run in `outputs/surprisal/`.
+   - **Temperature scaling and synthetic anomalies (2026-10-15)**, `outputs/surprisal/stage1_full_histfree_e{9,19,29}_T{1.0,1.25,1.5,2.0}.*`, analysed in section 9 of the notebook.
+     - **Method:** routes split by parity. T is chosen on half A (lowest NLL) and everything is reported on half B.
+     - **Synthetic anomalies:** the observed first step is replaced by a −6 m/s² brake, a +4 m/s² speed-up or a 4 m/s² swerve, snapped to the nearest code. Each is scored against the normal s of half B.
+
+     | Half B | e9, T 1.25 (chosen) | e19, T 1.25 (chosen) | e19, T 1.5 | e29, T 1.5 (chosen) | e29, T 1.0 (raw) |
+     |---|---|---|---|---|---|
+     | NLL on half A | 1.747 | **1.602** | 1.604 | 1.623 | 1.708 |
+     | mean s | −0.13 | +0.09 | −0.14 | −0.06 | +0.47 |
+     | Var s ÷ mean ν² | 1.18 | 1.87 | 1.02 | 1.26 | 4.55 |
+     | PIT coverage at α 0.9 / ECE | 0.92 / 0.087 | 0.89 / 0.025 | 0.93 / 0.068 | 0.92 / 0.048 | 0.83 / 0.043 |
+     | drive Z: mean / std / \|Z\| > 2 | −0.6 / 3.0 / 23% | +0.9 / 3.5 / 25% | −0.9 / 2.8 / 41% | −0.3 / 3.2 / 32% | +4.5 / 5.7 / 70% |
+     | swerve AUROC / detected at 1% false alarms | 0.97 / 0.84 | 0.98 / 0.86 | 0.97 / 0.86 | 0.97 / 0.85 | 0.98 / 0.85 |
+     | brake AUROC / detected at 1% | 0.85 / 0.09 | 0.87 / 0.15 | 0.86 / 0.15 | 0.88 / 0.16 | 0.89 / 0.16 |
+     | speed-up AUROC / detected at 1% | 0.76 / 0.11 | 0.84 / 0.13 | 0.83 / 0.14 | 0.82 / 0.12 | 0.84 / 0.11 |
+
+     - **One temperature fixes the per-step bias** on unseen drives: mean s ≈ 0, coverage ≈ nominal, Var s ÷ ν² ≈ 1–1.3 near the NLL optimum (T ≈ 1.25–1.5). The step-level miscalibration was mostly global overconfidence.
+     - **It does not fix the drive level.** Drive Z std stays ≈ 3 because the score's memory (lag-1 autocorrelation 0.3–0.37) is unchanged by T. Drive flags need a fitted variance factor or a block bootstrap.
+     - **Detection hardly depends on T** (T barely changes the ranking), but it improves with sharper, later checkpoints for longitudinal anomalies.
+       - Single-step swerves are clear: AUROC 0.97–0.98, ~85% detected at 1% false alarms.
+       - Single-step brakes and speed-ups are weak: AUROC 0.76–0.89, 9–16% detected at 1% false alarms. A 6 m/s² brake changes one 0.25 s step by only 0.19 m. Sustained anomalies (1–2 s) need the window or accumulated score; still to test.
+     - **Current best candidate for the scoring model: e19 with T ≈ 1.3.** It has the best held-out NLL, a calibrated step score, and detection as good as e29's.
+   - **Intermediate result (2026-10-13): the first 82 collected routes, frozen as a symlink snapshot `data/b2d_expert_snapshot_1013_0037`** so the live data root's dataset index isn't built early. 79 routes pass the clean-drive filter, 5,041 frames, `outputs/surprisal/stage1_partial82_*`.
+
+     | | Stage 0 (training, e29) | Stage 1 e9 | Stage 1 e19 | Stage 1 e29 |
+     |---|---|---|---|---|
+     | mean s (step) | +0.035 | +0.35 | +0.56 | **+0.65** |
+     | Var s ÷ mean ν² | 1.15 | 3.0 | 4.6 | 5.4 |
+     | mean ℓ / mean H | 1.26 / 1.22 | 2.36 / 2.01 | 2.26 / 1.70 | 2.27 / 1.62 |
+     | randomized-PIT coverage at α 0.5 / 0.9 / 0.95 | 0.51 / 0.90 / 0.95 | 0.48 / 0.86 / 0.91 | 0.45 / 0.82 / 0.88 | 0.44 / 0.81 / 0.87 |
+     | top-1 ECE | 0.018 | 0.019 | 0.043 | 0.053 |
+     | drive Z: mean / std | +0.37 / 1.44 | +2.4 / 3.4 | +4.2 / 4.6 | +4.9 / 5.1 |
+     | lag-1 autocorrelation of s | 0.07 | 0.29 | 0.33 | 0.35 |
+     | window mean s | −0.05 | +2.6 | +4.9 | +5.9 |
+
+     - **The model is overconfident on unseen normative drives.** Median s stays ≈ 0, but the tail is heavy: s > 6 on 3.6% of frames (0.3% in-sample), and the 99th percentile is 11.7 (4.3 in-sample). The top 5% of frames carry 69% of the mean; without them, mean s is +0.22.
+     - **Concentrated by scenario:** InterurbanAdvancedActorFlow +2.1, SequentialLaneChange +1.8 (no training folder), InterurbanActorFlow +1.6, MergerIntoSlowTrafficV2 +1.4, HighwayExit +1.0. ParkingExit and PedestrianCrossing are ≈ 0. 24% of routes have mean s > 1.
+     - **Training longer adds overconfidence, not accuracy:** the held-out ℓ is flat from e9 to e29 while H falls. Even e9 is miscalibrated, so part of the gap is generalisation, not overfitting.
+     - **Consequences:** Stage 0 (training frames) was too optimistic to validate the score. Recalibrating on held-out normal drives is needed before scoring anomalies: fit a temperature (or the η allowance) on half of Stage 1 and test on the other half. Temperature scaling can fix the ℓ/H mismatch but probably not the extreme tail. The tail needs a look at what the high-s frames are, which may be lateral manoeuvres or label artefacts.
    - **Scenario coverage:** the routes use 44 scenario types, all present in the autopilot runner. Six (5 routes each, 30 in total) have no training folder of that name: `VanillaNonSignalizedTurn`, `VanillaNonSignalizedTurnEncounterStopsign`, `VanillaSignalizedTurnEncounterGreenLight`, `VanillaSignalizedTurnEncounterRedLight`, `SequentialLaneChange` and `YieldToEmergencyVehicle`. Report them separately as out-of-distribution scenes.
    - **After collection:**
      1. Count the clean drives. The bucket builder keeps only drives the expert finished without infractions (minimum-speed and minor lane infractions excepted). Record the expert's DS from `data/b2d_expert/results/`.
@@ -276,20 +430,52 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
 3. **BADCAR normal drives (PDM-Lite):** the baseline that anomalies are injected into. Needed for η and the false-alarm rate. Open: whether the sensor rig and rate match LEAD's.
 4. **BADCAR anomalies:** detection AUROC per anomaly type, step vs window score, time to detection.
 
-## Next steps
+## Next steps, and why
 
-1. **Calibration**, as above: read Stage 0, then collect and score Stage 1.
-2. **Ablations, if useful:** history-free without rolling tokenization; rolling tokenization with history. These attribute the 87.3 DS.
-3. **Paper wording:** the scored head now also drives competitively (87.3 DS in waypoint mode), so the claim can be "the distribution that drives is the distribution that scores".
-4. **Fallback only if the score needs it: the whole-trajectory token.** One categorical over K = 4,096 trajectories, each 2 s.
-   - **Vocabulary:** k-means over expert 2 s windows.
-     - Held-out nearest-template error at 2 s (moving windows): 0.24 m. For comparison, K = 8,192 gives 0.21 m, and VADv2-style farthest-point sampling 0.43 m.
-   - **Head:** logit_k = q(c_t) · E(template_k); hard CE to the nearest template, in the virtual-car frame.
-   - **Conditioning:** history-free, as now.
-   - **Scores:**
-     - window score: exact;
-     - step score: via the first-step marginal, or a small first-step head on the 1,234-code vocabulary.
-   - **Precedent:** VADv2 (ICLR 2026) uses exactly this, with hard CE and argmax driving, and reaches 76.2 DS on Bench2Drive.
+1. **Score e26 with the temperature grid (here; ~10 min).**
+   - **Why:** e26 is the best-driving checkpoint (87.3 DS) but hasn't been scored. e19 is better calibrated raw, but drives 2.6 DS worse.
+   - If e26 + T calibrates as well as e29 + T = 1.5 did (mean s ≈ 0, coverage ≈ nominal on the held-out half), the paper uses one set of weights for both driving and scoring. Temperature changes only the scoring scale.
+   - **Next step:** `logs/run_calibration_grid.sh` with epoch 26, after linking `model_0026.pth` into `outputs/checkpoints/histfree_e26`.
+
+2. **A drive-level null (here; minutes).**
+   - **Why the martingale fails:** consecutive frames share the scene and the model's misunderstanding of it. If the model is wrong about a merge, it is wrong for the whole merge, so s_t is positively correlated over seconds.
+   - **The correct variance** of S is the long-run variance: Var(S) ≈ V · (1 + 2 Σ_k ρ_k), with ρ_k the autocorrelation at lag k (the Newey–West idea).
+   - **Fit on half A, test on half B,** with the target |Z| > 2 for about 5%:
+     - (a) an inflation factor from the measured ρ_k, out to about 4 s;
+     - (b) a block bootstrap, or empirical quantiles of Z from normal drives.
+   - Without this, drive flags are meaningless: 23–41% of normal drives exceed |Z| > 2 even after temperature scaling.
+
+3. **Sustained synthetic anomalies (here; minutes).**
+   - **Why:** real anomalies persist (1–2 s of hard braking, 10 s of speeding, weaving). A single step is a weak signal for longitudinal anomalies, but over n anomalous steps the summed score grows about linearly while normal noise grows like √n.
+   - Inject 1–2 s anomalies. Compare the window score with sliding sums of the step score (a CUSUM-style detector). That settles the "step vs window" question with data.
+   - **Caveat:** these are open-loop injections; the scene does not react and the car's state does not change. They measure detectability, not behaviour.
+
+4. **Residual scenario bias after scaling (here; minutes).**
+   - Check whether InvadingTurn, the interurban flows and SequentialLaneChange still sit above 0 at the chosen T.
+   - If so, the miscalibration is not purely global. Options:
+     - an entropy-dependent temperature (still label-free);
+     - more diverse training data;
+     - stating it as a limitation for scenario types underrepresented in training.
+   - Per-scenario calibration is not an option: it needs scenario labels, which test time does not have.
+
+5. **Inspect the extreme frames (notebook sections 6–7).**
+   - **Why:** for the top-s frames, decide whether it is normal driving the model never learned (lane changes, merges) or expert oddities. Examples: a swerve past a guardrail, and a red-light crawl with the light 98 m behind the car.
+   - Expert oddities are not valid normal data: exclude or report them. Genuine unlearned behaviour is a model gap that bounds the false-alarm rate.
+
+6. **BADCAR (needs the anomaly specification and data).**
+   - **Stage 2: its normal drives first.** PDM-Lite is a different normal driver than the LEAD expert, so this tests whether a competent driver with a different style scores ≈ 0. If not, fit the temperature and the drive-level null on PDM-Lite's normal drives. That is legitimate, because those are the drives the anomalies are compared against.
+   - **Stage 3: the anomalies.** AUROC per anomaly type, time to detection, and step vs window vs accumulated score, with the fitted temperature and null. This is the paper's main result.
+   - **Needed from the user:** anomaly types, injection rates, onset style (abrupt or ramped), and BADCAR's sensor rig and rate. A rig different from LEAD's changes the model's input, which is a separate problem.
+
+7. **Optional: a second normal driver.** Replay Think2Drive's Bench2Drive logs through LEAD's sensors, testing calibration on a different driving style without PDM-Lite's anomalies mixed in.
+
+8. **Ablations, if useful for the paper:** history-free without rolling tokenization, and rolling tokenization with history. These attribute the 87.3 DS. The e29 beam rerun is now optional, since e26 already shows how the late checkpoints drive.
+
+9. **Fallback only if the score needs it: the whole-trajectory token.** One categorical over K = 4,096 trajectories of 2 s each.
+   - **Vocabulary:** k-means over expert 2 s windows. Held-out nearest-template error at 2 s (moving windows): 0.24 m; K = 8,192 gives 0.21 m, and VADv2-style farthest-point sampling 0.43 m.
+   - **Head:** logit_k = q(c_t) · E(template_k); hard CE to the nearest template, in the virtual-car frame. History-free, as now.
+   - **Scores:** the window score is exact; the step score comes from the first-step marginal, or a small first-step head on the 1,234-code vocabulary.
+   - **Precedent:** VADv2 uses exactly this, with hard CE and argmax driving, and reaches 76.2 DS on Bench2Drive.
 
 ## Literature consulted (2026-10-07)
 
@@ -321,7 +507,7 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
 | Stability | `grad_clip_norm`, non-finite-step guard, `keep_all_epoch_checkpoints`, cuDNN attention disabled in the model constructor | `train.py`, `lead/adapt/adapt.py` |
 | Open-loop analysis (Step A) | per-horizon error for the GT-token floor, teacher forcing, each decoding and a reference checkpoint; token accuracy and NLL | `scripts/eval_open_loop_rollout.py` |
 | Launch script | `scripts/posttrain_token_decoder.sh` (+ `RUN_NAME`, `EXTRA_CONFIG`) | |
-| Surprisal calibration | step and window excess surprisal over whole drives, with the calibration checks of the plan; `--data_root` scores any CARLA data root | `scripts/score_surprisal.py` |
+| Surprisal calibration | step and window excess surprisal over whole drives, with the calibration checks of the plan; `--data_root` scores any CARLA data root; `--temperature` for post-hoc scaling; synthetic single-step anomalies (brake, speed-up, swerve) with AUROC and detection rates | `scripts/score_surprisal.py`; grid runner `logs/run_calibration_grid.sh`; plots in `analysis/unruliness_calibration.ipynb` |
 | Expert collection on benchmark routes | LEAD expert with `DATAGEN=1`, one CARLA per route with retries, local (no SLURM) | `scripts/collect_expert_b2d.sh` |
 
 **Uncommitted (2026-10-08):**

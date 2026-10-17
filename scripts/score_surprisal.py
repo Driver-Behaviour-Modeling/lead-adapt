@@ -14,9 +14,17 @@ Per frame:
 - top-1 confidence/accuracy, coverage mass m = P(codes more likely than u_1),
   and the quantization residual of the first step
 
+- synthetic step anomalies: the observed first step replaced by a hard brake
+  (-6 m/s^2), a speed-up (+4 m/s^2) or a swerve (4 m/s^2 lateral, either side),
+  snapped to its nearest code; their surprisal under the same scene, and how well
+  their s separates from the normal s (AUROC, detection at 1% / 5% false alarms)
+
 On normative drives a calibrated reference gives mean s ~ 0 overall and within
 speed bins / entropy deciles, Var s ~ mean nu^2, drive-level Z = S / sqrt(V)
 with mean 0 and std 1, coverage P(m + U p(u_1) < a) ~ a, and low ECE.
+
+--temperature T divides the logits by T before every softmax (post-hoc
+temperature scaling; T > 1 widens the distributions).
 
 Usage (repo root, LEAD_TRAINING_CONFIG unset):
     CUDA_VISIBLE_DEVICES=GPU-4ec20303-3c97-fc1c-9499-e5539efe3717 \
@@ -32,9 +40,10 @@ import os
 
 import numpy as np
 import torch
+from scipy.stats import rankdata
 from torch.utils.data import DataLoader, Subset
 
-from lead.adapt.adapt_decoder import generate_causal_mask
+from lead.adapt.adapt_decoder import compute_kdisks_distances, generate_causal_mask
 from lead.data_loader.carla_dataset import CARLAData
 from lead.training.config_training import TrainingConfig
 from lead.training.input_pipeline import prepared_training_batches
@@ -49,6 +58,7 @@ parser.add_argument("--window_samples", type=int, default=32)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--num_workers", type=int, default=16)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--temperature", type=float, default=1.0, help="divide the logits by T before every softmax")
 parser.add_argument("--name", default=None, help="output name; default: <checkpoint>_<data root>")
 args = parser.parse_args()
 
@@ -69,6 +79,24 @@ assert decoder.history_free, "scoring conditions on scene + current state only"
 centroids = decoder.kdisks_model.codebook.centroids.float()
 heading_weight = decoder.kdisks_model.codebook.heading_weight
 dt = config.waypoints_spacing / config.carla_fps
+
+
+
+def step_offset(longitudinal: float, lateral: float):
+    """Change of the body-frame step (dx, dy, dyaw) under an extra acceleration (m/s^2) at speed v."""
+    return lambda v: torch.stack(
+        [torch.full_like(v, 0.5 * longitudinal * dt**2), torch.full_like(v, 0.5 * lateral * dt**2), lateral / v.clamp_min(1.0) * dt],
+        dim=-1,
+    )
+
+
+# Synthetic first-step anomalies: (offset added to the observed step, minimum speed for it to make sense).
+ANOMALIES = {
+    "brake": (step_offset(-6.0, 0.0), 3.0),
+    "accelerate": (step_offset(4.0, 0.0), 0.0),
+    "swerve_left": (step_offset(0.0, 4.0), 3.0),
+    "swerve_right": (step_offset(0.0, -4.0), 3.0),
+}
 
 # The teacher-forced pass hands the decoder its cross-attention memory; keep it for sampling.
 captured = {}
@@ -116,7 +144,7 @@ with prepared_training_batches(loader, config) as batches, torch.inference_mode(
             decoder.training = False
             outputs = model._adapt_outputs
             tokens = outputs["future_token_ids"]
-            log_p = torch.log_softmax(outputs["output_logits"].float(), dim=-1)  # [B, T, V]
+            log_p = torch.log_softmax(outputs["output_logits"].float() / args.temperature, dim=-1)  # [B, T, V]
             bs, steps = tokens.shape
 
             # Step score: the first token given scene + current state.
@@ -133,6 +161,14 @@ with prepared_training_batches(loader, config) as batches, torch.inference_mode(
             add("residual", residual[:, :2].norm(dim=-1) + heading_weight * residual[:, 2].abs())
             add("token", tokens[:, 0])
 
+            # Synthetic anomalies: surprisal of the perturbed first step in the same scene.
+            first = outputs["future_deltas"][:, 0].float()
+            speed = torch.as_tensor(data["speed"]).float().to(first.device).view(-1)
+            for anomaly, (offset, min_speed) in ANOMALIES.items():
+                code = compute_kdisks_distances(first + offset(speed), centroids, heading_weight).argmin(-1)
+                valid = (speed > min_speed) & (code != tokens[:, 0])
+                add(f"l_{anomaly}", torch.where(valid, -log_p[:, 0].gather(-1, code[:, None])[:, 0], torch.nan))
+
             # Window score: the whole 2 s token sequence, entropy by ancestral sampling.
             add("l_win", -log_p.gather(-1, tokens[..., None])[..., 0].sum(-1))
             samples = args.window_samples
@@ -145,7 +181,7 @@ with prepared_training_batches(loader, config) as batches, torch.inference_mode(
                     encoder_output=context,
                     self_attention_mask=generate_causal_mask(sequence.shape[1], sequence.device),
                 )
-                step_log_p = torch.log_softmax(decoder.output_projection(hidden[:, -1]).float(), dim=-1)
+                step_log_p = torch.log_softmax(decoder.output_projection(hidden[:, -1]).float() / args.temperature, dim=-1)
                 token = torch.multinomial(step_log_p.exp(), 1)
                 sample_log_p += step_log_p.gather(-1, token)[:, 0]
                 sequence = torch.cat([sequence, token], dim=1)
@@ -232,6 +268,25 @@ summary["entropy_moving"] = {
 }
 summary["residual"] = {"median": float(np.median(f["residual"])), "frac_gt_2tau": float((f["residual"] > 0.1).mean())}
 
+
+def auroc(positive: np.ndarray, negative: np.ndarray) -> float:
+    """P(score of an anomaly > score of a normal frame), ties counted half (Mann-Whitney)."""
+    ranks = rankdata(np.concatenate([positive, negative]))[: len(positive)]
+    return float((ranks.sum() - len(positive) * (len(positive) + 1) / 2) / (len(positive) * len(negative)))
+
+
+# Synthetic anomalies against normal frames: separation of the step score s.
+summary["anomalies"] = {}
+for anomaly in ANOMALIES:
+    s_anom = (f[f"l_{anomaly}"] - f["H"])[~np.isnan(f[f"l_{anomaly}"])]
+    summary["anomalies"][anomaly] = {
+        "n": len(s_anom),
+        "mean_s": float(s_anom.mean()),
+        "auroc": auroc(s_anom, s),
+        "detected_at_1pct_false_alarms": float((s_anom > np.quantile(s, 0.99)).mean()),
+        "detected_at_5pct_false_alarms": float((s_anom > np.quantile(s, 0.95)).mean()),
+    }
+
 name = args.name or f"{os.path.basename(os.path.normpath(args.checkpoint_dir))}_{os.path.basename(os.path.normpath(config.carla_root))}"
 os.makedirs("outputs/surprisal", exist_ok=True)
 np.savez_compressed(f"outputs/surprisal/{name}.npz", route_names=route_names, **per_frame)
@@ -250,6 +305,12 @@ print(f"slope s~H {summary['slope_s_on_H']:+.3f}  l~H {summary['slope_l_on_H']:+
 e = summary["entropy_moving"]
 print(f"moving: Var H {e['var_H']:.3f}  R^2 of H on speed/|yaw rate| {e['r2_on_kinematics']:.3f}")
 print(f"residual: median {summary['residual']['median']:.3f}  frac > 2 tau {summary['residual']['frac_gt_2tau']:.3f}")
+print(f"temperature {args.temperature}; synthetic anomalies vs normal s (threshold at the normal 99% / 95% quantile):")
+for anomaly, m in summary["anomalies"].items():
+    print(
+        f"  {anomaly:13s} n {m['n']:6d}  mean s {m['mean_s']:+7.2f}  AUROC {m['auroc']:.3f}"
+        f"  detected {m['detected_at_1pct_false_alarms']:.2f} / {m['detected_at_5pct_false_alarms']:.2f}",
+    )
 print(f"{'':16s}{'n':>7s}{'mean s':>8s}{'std s':>7s}{'nu2':>7s}{'mean z':>8s}{'H':>7s}{'s_win':>8s}")
 rows = list(summary["speed_bins"].items()) + [(f"H decile {d}", m) for d, m in enumerate(summary["entropy_deciles"])]
 for label, m in rows + list(summary["scenarios"].items()):

@@ -53,6 +53,10 @@ class TrainingConfig(BaseConfig):
             return TargetDataset.CARLA_LEADERBOARD2_3CAMERAS
         elif "carla_leaderboad2_v10" in self.carla_root:
             return TargetDataset.CARLA_LEADERBOARD2_6CAMERAS
+        elif "b2d_expert" in self.carla_root:
+            # Expert re-run on the Bench2Drive routes (scripts/collect_expert_b2d.sh),
+            # recorded with the training data's sensor rig.
+            return TargetDataset.CARLA_LEADERBOARD2_3CAMERAS
         raise ValueError(
             f"Unknown CARLA root path: {self.carla_root}. Please register it in the config.",
         )
