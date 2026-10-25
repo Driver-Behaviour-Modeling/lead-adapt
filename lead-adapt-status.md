@@ -399,6 +399,34 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
        - Single-step swerves are clear: AUROC 0.97–0.98, ~85% detected at 1% false alarms.
        - Single-step brakes and speed-ups are weak: AUROC 0.76–0.89, 9–16% detected at 1% false alarms. A 6 m/s² brake changes one 0.25 s step by only 0.19 m. Sustained anomalies (1–2 s) need the window or accumulated score; still to test.
      - **Current best candidate for the scoring model: e19 with T ≈ 1.3.** It has the best held-out NLL, a calibrated step score, and detection as good as e29's.
+   - **Drive-level null, sustained anomalies and residual scenario bias (2026-10-17)**, `scripts/analyze_stage1_calibration.py`, `outputs/surprisal/*_analysis.json`.
+     - **Setup:** e29 at T = 1.5 (fitted on half A), with T = 1.0 for comparison. Everything is fitted on half A (100 drives) and reported on half B (100 drives).
+     - **Drive Z on half B** (targets: mean 0, std 1, \|Z\| > 2 for 4.6%):
+
+       | Correction | e29, T 1.5 | e29, T 1.0 |
+       |---|---|---|
+       | none | −0.33 / 3.14 / 32% | +4.51 / 5.67 / 70% |
+       | per-step bias from A removed | −0.01 / 3.10 / 27% | +0.21 / 6.32 / 57% |
+       | theory: Newey–West, 4 s of lags (c = 4.8 / 18.7) | 0.00 / 1.42 / 7% | +0.05 / 1.46 / 7% |
+       | **empirical variance factor from A (c = 8.5 / 37.7)** | **0.00 / 1.07 / 4.0%** | +0.03 / 1.03 / 4.0% |
+
+       - The empirical null works: removing the half-A bias and dividing by √c gives a calibrated drive flag on the held-out half.
+       - The Newey–West theory explains only about half of c. The rest is between-drive variation, where whole drives are consistently more or less surprising, mostly by scenario type (below).
+       - **Cost:** with c ≈ 8.5, a drive needs about √8.5 ≈ 2.9× more accumulated excess to be flagged than the martingale theory implies. The drive-level null is valid but conservative.
+     - **Sustained synthetic anomalies** (open loop: the per-frame anomalous step scores summed over n consecutive frames, against normal n-frame sums). AUROC / detected at 1% false alarms, e29 T 1.5:
+
+       | Anomaly | 0.25 s | 0.5 s | 1 s | 2 s |
+       |---|---|---|---|---|
+       | brake −6 m/s² | 0.88 / 16% | 0.93 / 24% | 0.96 / 35% | 0.98 / 53% |
+       | speed-up +4 m/s² | 0.82 / 12% | 0.86 / 15% | 0.90 / 15% | 0.93 / 16% |
+       | swerve 4 m/s² (either side) | 0.97 / 84–85% | 0.98 / 89% | 0.99 / 92% | 1.00 / 97% |
+
+       - Accumulating over time helps braking a lot and speed-ups little. T barely matters (T = 1.0 is within ±0.02).
+       - **Caveat (important for BADCAR):** open-loop sums repeat a one-step deviation from the *recorded* state. In closed loop the state itself changes: a speeding car is already fast. The model conditions on the current state (speed is an input), so it predicts the continuation of an already-anomalous speed, and only the *change* each step is surprising. The score detects anomalous **actions** better than anomalous **states** (sustained speeding, a persistent lane offset). A state term may be needed, for example the speed head's target speed against the actual speed.
+     - **Residual scenario bias on half B after T = 1.5** (overall mean s −0.06):
+       - Still positive: InvadingTurn +1.86, InterurbanAdvancedActorFlow +0.93, HighwayCutIn +0.83, InterurbanActorFlow +0.57, SequentialLaneChange +0.30.
+       - Slightly negative: VehicleOpensDoorTwoWays −0.40, DynamicObjectCrossing −0.39, ParkingExit −0.38, MergerIntoSlowTraffic −0.35.
+       - **Temperature removes the global part, not the scenario part.** InvadingTurn is ≈ 0 in-sample (Stage 0) but +1.9 here, so the Bench2Drive InvadingTurn routes make the expert behave differently from its training routes. Inspect those frames next (notebook section 7).
    - **Intermediate result (2026-10-13): the first 82 collected routes, frozen as a symlink snapshot `data/b2d_expert_snapshot_1013_0037`** so the live data root's dataset index isn't built early. 79 routes pass the clean-drive filter, 5,041 frames, `outputs/surprisal/stage1_partial82_*`.
 
      | | Stage 0 (training, e29) | Stage 1 e9 | Stage 1 e19 | Stage 1 e29 |
@@ -508,6 +536,7 @@ For comparison, full runs in the same mode: fresh e27 53.1, `full_v1` 70.3, navc
 | Open-loop analysis (Step A) | per-horizon error for the GT-token floor, teacher forcing, each decoding and a reference checkpoint; token accuracy and NLL | `scripts/eval_open_loop_rollout.py` |
 | Launch script | `scripts/posttrain_token_decoder.sh` (+ `RUN_NAME`, `EXTRA_CONFIG`) | |
 | Surprisal calibration | step and window excess surprisal over whole drives, with the calibration checks of the plan; `--data_root` scores any CARLA data root; `--temperature` for post-hoc scaling; synthetic single-step anomalies (brake, speed-up, swerve) with AUROC and detection rates | `scripts/score_surprisal.py`; grid runner `logs/run_calibration_grid.sh`; plots in `analysis/unruliness_calibration.ipynb` |
+| Stage 1 calibration analysis | drive-level null (Newey–West and empirical, fitted on half A, reported on half B), sustained synthetic anomalies (summed step scores over 0.25–2 s), residual scenario bias | `scripts/analyze_stage1_calibration.py --run <run>` |
 | Expert collection on benchmark routes | LEAD expert with `DATAGEN=1`, one CARLA per route with retries, local (no SLURM) | `scripts/collect_expert_b2d.sh` |
 
 **Uncommitted (2026-10-08):**
