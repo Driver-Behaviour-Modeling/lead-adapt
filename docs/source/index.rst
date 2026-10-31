@@ -28,6 +28,8 @@ The basic section is sufficient to get started with the local data collection, t
    carla_training
    training_performance
    navigation_conditioning
+   world_modelling
+   integrated_token_world
    evaluation
    turn_diagnostics
    jupyter_notebooks

@@ -735,6 +735,9 @@ class TrainingConfig(BaseConfig):
     # then initialize and modulate route/speed queries at every planning layer.
     # Opt in for a new training run; false preserves old checkpoint architecture.
     adapt_navigation_conditioning = False
+    # Explicit navigation geometry also conditions the AR token distribution.
+    # Identity initialisation preserves existing history-free checkpoint outputs.
+    adapt_token_navigation_conditioning = False
     # Train only the AR token decoder (transformer decoder + output projection)
     # with token cross-entropy; every other module is frozen and kept in eval
     # mode, so route/speed control is unchanged. Used to fit the token
@@ -753,6 +756,10 @@ class TrainingConfig(BaseConfig):
     # quantization error does not accumulate and an offset start is corrected
     # over several feasible steps.
     adapt_rolling_tokenization = False
+    # Match the PDFs' causal step token Q(delta_t): the first rolling token is
+    # the nearest observed motion. Later steps retain sequence error recovery.
+    # Changes targets and therefore requires training and fresh calibration.
+    adapt_rolling_causal_first = False
     # Beam width of that search; 1 is a step-by-step greedy match, which never
     # turns back towards the path from an offset start.
     adapt_rolling_beam_width = 32
@@ -764,6 +771,18 @@ class TrainingConfig(BaseConfig):
     adapt_decoding = "greedy"
     # Beam width for adapt_decoding="beam".
     adapt_beam_width = 8
+    # Predict radar-observed vehicle futures and condition ego planning on them.
+    # Targets are supervision only; inference consumes predicted future states.
+    adapt_world_model = False
+    world_num_steps = 8
+    world_num_modes = 3
+    world_step_seconds = 0.25
+    world_hidden_dim = 256
+    world_position_scale = 10.0
+    world_max_speed = 40.0  # Other actors need not share the ego speed limit.
+    world_position_loss_weight = 1.0
+    world_mode_loss_weight = 0.1
+    world_vehicle_loss_weight = 0.1
     # Path to the K-disks vocabulary pickle produced by
     # scripts/build_kdisks_carla.py. Loaded by KDisksModel at decoder init.
     # Checkpoints trained before the body-frame fix store the legacy
@@ -1144,6 +1163,13 @@ class TrainingConfig(BaseConfig):
         if self.adapt_waypoints_from_tokens:
             weights["loss_trajectory"] = 0.0
             weights["loss_soft_frechet"] = 0.0
+
+        if self.adapt_world_model:
+            weights.update(
+                world_loss_position=self.world_position_loss_weight,
+                world_loss_mode=self.world_mode_loss_weight,
+                world_loss_vehicle=self.world_vehicle_loss_weight,
+            )
 
         if self.adapt_train_token_decoder_only:
             weights = {

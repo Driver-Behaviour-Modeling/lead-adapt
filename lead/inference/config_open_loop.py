@@ -24,3 +24,6 @@ class OpenLoopConfig(BaseConfig):
     brake_threshold = 0.9
     # If true be strict when load weight
     strict_weight_load = True
+    # Runtime diagnostics keep all trained modules and strict checkpoint loading.
+    adapt_disable_world_fusion = False
+    adapt_disable_token_navigation = False

@@ -17,6 +17,7 @@ from lead.adapt.center_net_decoder import (
 from lead.adapt.perspective_decoder import PerspectiveDecoder
 from lead.adapt.radar_detector import RadarDetector
 from lead.adapt.transfuser_backbone import TransfuserBackbone
+from lead.adapt.world_model import VehicleWorldModel
 from lead.common.constants import SourceDataset
 from lead.training.config_training import TrainingConfig
 
@@ -39,6 +40,19 @@ class TFv6(nn.Module):
         # math backends are finite on the same inputs. Disabled here so training,
         # analysis scripts and the driving agent all get it.
         torch.backends.cuda.enable_cudnn_sdp(False)
+        self.world_model_enabled = getattr(config, "adapt_world_model", False)
+        if self.world_model_enabled and not (
+            config.use_adapt_decoder
+            and config.use_carla_data
+            and not config.mixed_data_training
+            and config.use_radars
+            and config.radar_detection
+            and config.use_radar_detection
+            and config.detect_boxes
+        ):
+            raise ValueError(
+                "Vehicle world modelling requires CARLA ADAPT with radar detection and box labels",
+            )
 
         self.backbone = TransfuserBackbone(self.device, self.config)
 
@@ -118,6 +132,8 @@ class TFv6(nn.Module):
                 config=self.config,
                 device=self.device,
             ).to(self.device)
+        if self.world_model_enabled:
+            self.world_model = VehicleWorldModel(config)
 
     @beartype
     def forward(self, data: dict[str, typing.Any]) -> Prediction:
@@ -135,6 +151,10 @@ class TFv6(nn.Module):
         radar_features = radar_predictions = None
         if self.config.use_carla_data and self.config.radar_detection:
             radar_features, radar_predictions = self.radar_detector(bev_features, data)
+        actor_futures = None
+        if self.world_model_enabled:
+            # No target data enters the predictor or its planning memory.
+            actor_futures = self.world_model(radar_features, radar_predictions)
 
         # Planning heads
         self._adapt_outputs = None
@@ -149,6 +169,12 @@ class TFv6(nn.Module):
                 radar_predictions=planner_radar_predictions,
                 data=data,
                 log=self.log,
+                world_memory=actor_futures["memory"]
+                if actor_futures is not None
+                else None,
+                world_confidence=actor_futures["memory_confidence"]
+                if actor_futures is not None
+                else None,
             )
             pred_future_waypoints = adapt_outputs["pred_future_waypoints"]
             pred_headings = adapt_outputs["pred_headings"]
@@ -214,6 +240,7 @@ class TFv6(nn.Module):
             pred_bounding_box_navsim=pred_bounding_box_navsim,
             pred_bev_semantic_navsim=pred_bev_semantic_navsim,
             pred_headings=pred_headings,
+            pred_actor_futures=actor_futures,
         )
 
     @beartype
@@ -277,12 +304,21 @@ class TFv6(nn.Module):
 
         # Radar detection loss
         if self.config.radar_detection and self.config.use_carla_data:
-            self.radar_detector.compute_loss(
+            matching = self.radar_detector.compute_loss(
                 pred=predictions.pred_radar_predictions,
                 data=data,
                 loss=loss,
                 log=self.log,
+                return_matching=self.world_model_enabled,
             )
+            if self.world_model_enabled:
+                self.world_model.compute_loss(
+                    predictions.pred_actor_futures,
+                    data,
+                    matching,
+                    loss,
+                    self.log,
+                )
 
         # Planning loss (ADAPT autoregressive decoder)
         if self.config.use_adapt_decoder:
@@ -327,3 +363,4 @@ class Prediction:
         jt.Float[torch.Tensor, "bs num_bev_classes_navsim bev_height bev_width"] | None
     )
     pred_headings: jt.Float[torch.Tensor, "bs n_waypoints"] | None
+    pred_actor_futures: dict[str, torch.Tensor] | None = None

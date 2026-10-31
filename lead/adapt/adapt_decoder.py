@@ -12,6 +12,7 @@ from torch import nn
 import lead.common.common_utils as common_utils
 from lead.adapt import transfuser_utils as fn
 from lead.adapt.navigation_conditioning import NavigationEncoder, NavigationModulation
+from lead.adapt.world_attention import FutureContextFusion
 from lead.common.constants import RadarLabels
 from lead.kdisks import KDisksModel
 from lead.training.config_training import TrainingConfig
@@ -289,6 +290,13 @@ class AdaptDecoder(nn.Module):
         self.history_free = config.adapt_history_free
         self.rolling_tokenization = config.adapt_rolling_tokenization
         self.rolling_beam_width = config.adapt_rolling_beam_width
+        self.rolling_causal_first = config.adapt_rolling_causal_first
+        if self.rolling_causal_first and not (
+            self.history_free and self.rolling_tokenization
+        ):
+            raise ValueError(
+                "Causal-first targets require history-free rolling tokenization",
+            )
         if self.history_free and self.kdisks_model.codebook.frame != "body":
             raise ValueError("adapt_history_free needs a body-frame codebook")
         # History-free decoding starts from a learned start token, stored as an
@@ -439,7 +447,24 @@ class AdaptDecoder(nn.Module):
                 for _ in self._plan_decoder.layers
             )
 
+        self.token_navigation_conditioning = config.adapt_token_navigation_conditioning
+        self.disable_token_navigation_for_inference = False
+        if self.token_navigation_conditioning:
+            if not self.navigation_conditioning:
+                raise ValueError(
+                    "Token navigation conditioning requires adapt_navigation_conditioning",
+                )
+            self._token_navigation_modulation = NavigationModulation(
+                config.kinematic_embed_dim,
+            )
+
         # Scheduled-sampling probability — bumped by the training loop if used.
+        self.world_model_enabled = getattr(config, "adapt_world_model", False)
+        if self.world_model_enabled:
+            self._world_fusion = FutureContextFusion(
+                config.kinematic_embed_dim,
+                config.decoder_num_heads,
+            )
         self._ss_prob = 0.0
 
     def _beam_search(
@@ -522,6 +547,7 @@ class AdaptDecoder(nn.Module):
             poses = start_pose.unsqueeze(1)  # [B, beams, 3]
             cost = torch.zeros(bs, 1, device=start_pose.device)
             tokens = torch.zeros(bs, 1, 0, dtype=torch.long, device=start_pose.device)
+            causal_first = getattr(self, "rolling_causal_first", False)
             for step in range(steps):
                 cos_h = torch.cos(poses[..., 2:3])
                 sin_h = torch.sin(poses[..., 2:3])
@@ -547,8 +573,21 @@ class AdaptDecoder(nn.Module):
                     ).abs()
                 )
                 total = (cost.unsqueeze(-1) + step_cost).view(bs, -1)
+                if step == 0 and causal_first:
+                    # Nearest first-step pose is exactly Q(delta_t): rotation
+                    # preserves the positional norm and the heading metric.
+                    # Do not let a later observed pose change today's label.
+                    first = step_cost[:, 0].argmin(-1, keepdim=True)
+                    keep = torch.zeros_like(total, dtype=torch.bool).scatter_(
+                        1,
+                        first,
+                        True,
+                    )
+                    total = total.masked_fill(~keep, torch.inf)
                 cost, flat = total.topk(
-                    min(self.rolling_beam_width, total.shape[1]),
+                    1
+                    if step == 0 and causal_first
+                    else min(self.rolling_beam_width, total.shape[1]),
                     largest=False,
                 )
                 beam = flat // vocab
@@ -610,6 +649,8 @@ class AdaptDecoder(nn.Module):
         radar_predictions: jt.Float[torch.Tensor, "bs num_radar_queries 4"] | None,
         data: dict,
         log: dict,
+        world_memory: torch.Tensor | None = None,
+        world_confidence: torch.Tensor | None = None,
     ) -> AdaptDecoderOutput:
         """Run the autoregressive ADAPT decoder over BEV-derived context.
 
@@ -630,6 +671,10 @@ class AdaptDecoder(nn.Module):
                 ``past_yaws`` for history. During training, ``future_waypoints``
                 and ``future_yaws`` are used to build teacher-forcing targets.
             log: Mutable log dict for metrics.
+            world_memory: Predicted actor-future tokens, or ``None`` when the
+                world model is disabled.
+            world_confidence: Per-token confidence values for future attention,
+                or ``None`` when the world model is disabled.
 
         Returns:
             Dict with ``pred_future_waypoints``, ``pred_headings``,
@@ -763,6 +808,27 @@ class AdaptDecoder(nn.Module):
         encoder_context = encoder_context + self.encoder_context_pos_embedding(
             pos_ids,
         )
+        if self.training and self.disable_token_navigation_for_inference:
+            raise RuntimeError("Token navigation can only be disabled for inference")
+        if (
+            self.token_navigation_conditioning
+            and not self.disable_token_navigation_for_inference
+        ):
+            # Navigation is observed before the action, independent of any
+            # teacher-forced future prefix. Capturing this context also makes
+            # scoring and ancestral sampling use the same conditioning.
+            encoder_context = self._token_navigation_modulation(
+                encoder_context,
+                self._navigation_encoder(data),
+            )
+        if self.world_model_enabled:
+            if world_memory is None or world_confidence is None:
+                raise ValueError("World-enabled ADAPT requires predicted actor futures")
+            encoder_context = self._world_fusion(
+                encoder_context,
+                world_memory,
+                world_confidence,
+            )
 
         # ----------------------------------------------------------------------
         # 5. Autoregressive decode

@@ -10,13 +10,13 @@ import torch
 import torch.nn.functional as F
 from beartype import beartype
 
+from lead.adapt.adapt import Prediction
+from lead.adapt.center_net_decoder import PredictedBoundingBox
+from lead.adapt.planning_decoder import decode_two_hot
 from lead.common.constants import TransfuserBoundingBoxIndex
 from lead.data_loader import carla_dataset_utils
 from lead.inference import inference_utils
 from lead.inference.config_open_loop import OpenLoopConfig
-from lead.adapt.center_net_decoder import PredictedBoundingBox
-from lead.adapt.planning_decoder import decode_two_hot
-from lead.adapt.adapt import Prediction
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
 
@@ -67,6 +67,19 @@ class OpenLoopInference:
                     strict=config_open_loop.strict_weight_load,
                 )
                 net.cuda(device=self.device).eval()
+                if self.config_open_loop.adapt_disable_world_fusion:
+                    fusion = getattr(net.adapt_decoder, "_world_fusion", None)
+                    if fusion is None:
+                        raise ValueError(
+                            "World-fusion ablation requires a world-model checkpoint",
+                        )
+                    fusion.disabled_for_inference = True
+                if self.config_open_loop.adapt_disable_token_navigation:
+                    if not net.adapt_decoder.token_navigation_conditioning:
+                        raise ValueError(
+                            "Token-navigation ablation requires the integrated token model",
+                        )
+                    net.adapt_decoder.disable_token_navigation_for_inference = True
                 self.nets.append(net)
         self.step = 4  # Constant so produced images start with 5, not really important
 
@@ -95,18 +108,16 @@ class OpenLoopInference:
             pred_target_speed_distribution
         ) = pred_future_headings = None
 
-        has_any_planner = (
-            self.config_training.use_planning_decoder
-            or getattr(self.config_training, "use_adapt_decoder", False)
+        has_any_planner = self.config_training.use_planning_decoder or getattr(
+            self.config_training,
+            "use_adapt_decoder",
+            False,
         )
         if has_any_planner:
             if (
-                (
-                    self.config_training.use_planning_decoder
-                    and self.config_training.predict_target_speed
-                )
-                or getattr(self.config_training, "use_adapt_decoder", False)
-            ):
+                self.config_training.use_planning_decoder
+                and self.config_training.predict_target_speed
+            ) or getattr(self.config_training, "use_adapt_decoder", False):
                 pred_target_speed_logits = torch.stack(
                     [pred.pred_target_speed_distribution[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average target speed logits.
@@ -139,12 +150,9 @@ class OpenLoopInference:
                 ).mean(dim=0, keepdim=True)  # Average waypoints.
 
             if (
-                (
-                    self.config_training.use_planning_decoder
-                    and self.config_training.predict_spatial_path
-                )
-                or getattr(self.config_training, "use_adapt_decoder", False)
-            ):
+                self.config_training.use_planning_decoder
+                and self.config_training.predict_spatial_path
+            ) or getattr(self.config_training, "use_adapt_decoder", False):
                 pred_routes = torch.stack(
                     [pred.pred_route[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average route.
